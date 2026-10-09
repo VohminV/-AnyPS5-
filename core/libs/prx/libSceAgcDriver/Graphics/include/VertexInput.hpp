@@ -209,19 +209,28 @@ inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
 
 inline std::uint32_t HighestDrawIndex(std::span<const std::byte> indices, std::uint32_t indexSize, bool skipRestart) {
     Require(indexSize == 2 || indexSize == 4, "unsupported index size");
-    const auto restartIndex = indexSize == 2 ? 0xffffu : 0xffffffffu;
+    // The element size selects the loop once: an indexed draw scans its whole range here, so the
+    // per-index size branch and the per-index memcpy dispatch are repeated work on every packet.
+    const auto* data = indices.data();
+    const auto size = indices.size();
     std::uint32_t highest = 0;
-    for (std::size_t offset = 0; offset + indexSize <= indices.size(); offset += indexSize) {
-        std::uint32_t index = 0;
-        if (indexSize == 2) {
+    if (indexSize == 2) {
+        constexpr std::uint32_t restart = 0xffffu;
+        for (std::size_t offset = 0; offset + 2 <= size; offset += 2) {
             std::uint16_t value = 0;
-            std::memcpy(&value, indices.data() + offset, sizeof(value));
-            index = value;
-        } else {
-            std::memcpy(&index, indices.data() + offset, sizeof(index));
+            std::memcpy(&value, data + offset, sizeof(value));
+            const std::uint32_t index = value;
+            if (skipRestart && index == restart) continue;
+            if (index > highest) highest = index;
         }
-        if (skipRestart && index == restartIndex) continue;
-        highest = std::max(highest, index);
+        return highest;
+    }
+    constexpr std::uint32_t restart = 0xffffffffu;
+    for (std::size_t offset = 0; offset + 4 <= size; offset += 4) {
+        std::uint32_t index = 0;
+        std::memcpy(&index, data + offset, sizeof(index));
+        if (skipRestart && index == restart) continue;
+        if (index > highest) highest = index;
     }
     return highest;
 }

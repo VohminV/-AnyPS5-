@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include "prx/libSceAgcDriver/CpuBackend/include/CpuBackend/Backend.hpp"
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
@@ -91,6 +92,92 @@ void Driver::execute(const Submission& submission) {
     }
     PacketHistory recent{submission.commands};
 
+    {
+        static const bool shadowProfile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (shadowProfile && !submission.commands.empty()) {
+            try {
+                thread_local AgcDriver::CpuBackend::Backend shadowBackend([] {
+                    AgcDriver::CpuBackend::Backend::Options options;
+                    options.mode = AgcDriver::CpuBackend::Mode::Fast;
+                    options.threads = 1;
+                    return options;
+                }());
+                thread_local unsigned long long shadowSubmissions = 0;
+                thread_local unsigned long long shadowPackets = 0;
+                thread_local unsigned long long shadowHits = 0;
+                thread_local unsigned long long shadowMisses = 0;
+                thread_local unsigned long long shadowFallbacks = 0;
+                thread_local auto shadowReported = std::chrono::steady_clock::now();
+                std::span<const std::uint32_t> shadowWords(submission.commands.data(), submission.commands.size());
+                AgcDriver::CpuBackend::SubmitStats shadowStats = shadowBackend.Submit(shadowWords);
+                ++shadowSubmissions;
+                shadowPackets += shadowStats.packets;
+                shadowHits += shadowStats.resourceHits;
+                shadowMisses += shadowStats.resourceMisses;
+                if (shadowStats.fellBack) {
+                    ++shadowFallbacks;
+                }
+                auto shadowNow = std::chrono::steady_clock::now();
+                if (shadowNow - shadowReported > std::chrono::seconds(10)) {
+                    shadowReported = shadowNow;
+                    AgcDriver::ProfilePrint_nid_no_patch("[cpubackend] shadow %llu submissions %llu packets %llu hits %llu misses\n", static_cast<unsigned long long>(shadowSubmissions), static_cast<unsigned long long>(shadowPackets), static_cast<unsigned long long>(shadowHits), static_cast<unsigned long long>(shadowMisses));
+                    AgcDriver::ProfilePrint_nid_no_patch("[cpubackend] shadow resources %llu fallbacks path %llu digest %llu\n", static_cast<unsigned long long>(shadowFallbacks), static_cast<unsigned long long>(static_cast<int>(shadowBackend.ActivePath())), static_cast<unsigned long long>(shadowBackend.LastDigest()));
+                }
+            } catch (...) {
+            }
+        }
+    }
+
+    thread_local std::vector<AgcDriver::CpuBackend::DecodedPacket> walkDecoded;
+    thread_local std::vector<std::uint8_t> walkSkipFlush;
+    thread_local unsigned long long walkSubmissions = 0;
+    thread_local unsigned long long walkBatchTotal = 0;
+    thread_local unsigned long long walkSkipped = 0;
+    thread_local unsigned long long walkFallbacks = 0;
+    thread_local auto walkReported = std::chrono::steady_clock::now();
+    bool walkUseTable = false;
+    {
+        static const AgcDriver::CpuBackend::Mode walkMode = AgcDriver::CpuBackend::ModeFromEnv();
+        if (walkMode != AgcDriver::CpuBackend::Mode::Legacy && !submission.commands.empty()) {
+            try {
+                if (walkDecoded.size() < submission.commands.size()) walkDecoded.resize(submission.commands.size());
+                AgcDriver::CpuBackend::DecodeStats walkStats{};
+                std::size_t walkCount = AgcDriver::CpuBackend::DecodeRange(std::span<const std::uint32_t>(submission.commands.data(), submission.commands.size()), std::span<AgcDriver::CpuBackend::DecodedPacket>(walkDecoded.data(), submission.commands.size()), &walkStats);
+                bool walkOk = walkStats.truncated == 0;
+                for (std::size_t i = 0; walkOk && i < walkCount; ++i) {
+                    if (walkDecoded[i].packetClass == AgcDriver::CpuBackend::PacketClass::Unknown) walkOk = false;
+                }
+                if (walkOk) {
+                    AgcDriver::CpuBackend::PlanStats walkPlan{};
+                    std::vector<AgcDriver::CpuBackend::Batch> walkBatches = AgcDriver::CpuBackend::PlanBatches(std::span<const AgcDriver::CpuBackend::DecodedPacket>(walkDecoded.data(), walkCount), &walkPlan);
+                    walkSkipFlush.assign(submission.commands.size(), 0);
+                    for (std::size_t i = 0; i < walkCount; ++i) {
+                        if (walkDecoded[i].packetClass == AgcDriver::CpuBackend::PacketClass::Filler) walkSkipFlush[walkDecoded[i].offset] = 1;
+                    }
+                    for (const auto& batch : walkBatches) {
+                        if (batch.kind != AgcDriver::CpuBackend::BatchKind::SetRun) continue;
+                        for (std::size_t p = 1; p < batch.packetCount; ++p) {
+                            walkSkipFlush[walkDecoded[batch.beginPacket + p].offset] = 1;
+                            ++walkSkipped;
+                        }
+                    }
+                    walkUseTable = true;
+                    ++walkSubmissions;
+                    walkBatchTotal += walkPlan.batches;
+                    auto walkNow = std::chrono::steady_clock::now();
+                    if (walkNow - walkReported > std::chrono::seconds(10)) {
+                        walkReported = walkNow;
+                        AgcDriver::ProfilePrint_nid_no_patch("[cpubackend] walk %llu submissions %llu batches %llu flushes skipped %llu fallbacks\n", static_cast<unsigned long long>(walkSubmissions), static_cast<unsigned long long>(walkBatchTotal), static_cast<unsigned long long>(walkSkipped), static_cast<unsigned long long>(walkFallbacks));
+                    }
+                } else {
+                    ++walkFallbacks;
+                }
+            } catch (...) {
+                ++walkFallbacks;
+            }
+        }
+    }
+
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
     thread_local PacketProfile* packetProfileSlot = nullptr;
@@ -129,7 +216,7 @@ void Driver::execute(const Submission& submission) {
         }
 
         const auto flushStart = profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37);
+        if (!walkUseTable || !walkSkipFlush[cursor]) flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37);
         timing.Mark("flush_between_packets");
         PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, packetProfile, std::chrono::steady_clock::now()};
 

@@ -374,6 +374,9 @@ void append(std::vector<std::byte>& key, const TValue& value) {
 std::vector<std::byte> pipelineKey(const Context& context, const State& state, const VertexInputLayout& input, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     using Stage = ShaderRecompiler::ShaderStage;
     std::vector<std::byte> key;
+    // Built anew for every draw, so repeated growth reallocations are per-packet allocator work
+    // (ContentKey already reserves for the same reason); the bytes and the hash are unchanged.
+    key.reserve(512);
     append(key, context.device);
     append(key, attachmentLayout);
     append(key, shaders.size());

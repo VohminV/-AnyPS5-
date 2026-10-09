@@ -31,6 +31,8 @@ endfunction()
 
 ensure_agc_glslang()
 
+add_subdirectory(CpuBackend)
+
 set(agcTextureDetileShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/TextureDetile.comp)
 set(agcTextureDetileGeneratedRoot ${CMAKE_CURRENT_BINARY_DIR}/generated)
 set(agcTextureDetileGeneratedDir ${agcTextureDetileGeneratedRoot}/prx/libSceAgcDriver/Graphics/shaders)
@@ -194,6 +196,7 @@ add_shader_recompiler(shader_recompiler_agc_driver libc
 )
 
 target_link_libraries(libSceAgcDriver PRIVATE
+        agcCpuBackend
         shader_recompiler_agc_driver
         SDL2-static
         libc

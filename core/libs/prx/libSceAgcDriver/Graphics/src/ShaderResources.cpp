@@ -1672,7 +1672,7 @@ bool ShaderResources::fastRevalidateEach() {
         } else if (!GuestMemory::UnchangedSince(address, bytes, surface.generation)) {
             return false;
         }
-        if (surface.resource.dccAddress != 0 && TextureClearKeys(surface.resource, surface.bytes) != surface.keys) return false;
+        if (surface.resource.dccAddress != 0 && ProvedClearKeys(surface.resource, surface.bytes, textures[i]->KeyProof()) != surface.keys) return false;
         // A view made under fast-clear keys stays one only while its image still has results pending
         // over the surface (the lookup prefers them to the clear); once they are flushed the clear
         // the image cannot see wins and the lookup makes a snapshot (cachedTexture's hit rule).

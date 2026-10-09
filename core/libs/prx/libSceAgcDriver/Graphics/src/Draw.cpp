@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libc/include/General.hpp"
@@ -29,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 #include <utility>
 
 namespace AgcDriver::Graphics {
@@ -111,9 +113,74 @@ void storeClearTexels(const Context& context, const ColorTarget& color, const st
     MarkDccUncompressed(context, color.dccAddress, color.bytes, colorKeyCount(color, color.bytes));
 }
 
+struct DrawDccMemoEntry {
+    DccKeys keys = DccKeys::Uncompressed;
+    std::uint64_t generation = 0;
+    std::uint64_t bytes = 0;
+};
+
+struct DrawDccMemoState {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, DrawDccMemoEntry> entries;
+    unsigned long long proved = 0;
+    unsigned long long scanned = 0;
+    unsigned long long unstable = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+DrawDccMemoState& DrawDccMemo() {
+    static DrawDccMemoState memo;
+    return memo;
+}
+
+DccKeys ProvedDrawDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
+    if (!KeyFastPath()) return CurrentDccKeys(metaAddress, surfaceBytes);
+    const std::size_t count = DccKeyBytes(surfaceBytes);
+    if (metaAddress == 0 || count == 0) return CurrentDccKeys(metaAddress, surfaceBytes);
+    auto& memo = DrawDccMemo();
+    const std::uint64_t collected = GuestMemory::CollectWrites(metaAddress, count);
+    {
+        std::lock_guard lock(memo.mutex);
+        const auto found = memo.entries.find(metaAddress);
+        if (found != memo.entries.end() && found->second.bytes == surfaceBytes && found->second.generation != 0 && collected != 0 && GuestMemory::UnchangedSince(metaAddress, count, found->second.generation)) {
+            ++memo.proved;
+            return found->second.keys;
+        }
+    }
+    const DccKeys keys = CurrentDccKeys(metaAddress, surfaceBytes);
+    bool stable = collected != 0;
+    if (stable) {
+        if (GuestMemory::GpuMutex().HeldByThisThread()) {
+            if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+                const auto info = recorder->DescribePendingWrite(metaAddress, count);
+                stable = !info.has_value() || info->signaled;
+            }
+        } else {
+            stable = !Recorder::SnapshotWriteOverlaps(metaAddress, count);
+        }
+    }
+    {
+        std::lock_guard lock(memo.mutex);
+        if (stable) {
+            if (memo.entries.size() >= 512) memo.entries.clear();
+            memo.entries[metaAddress] = DrawDccMemoEntry{keys, collected, surfaceBytes};
+        } else {
+            memo.entries.erase(metaAddress);
+        }
+        ++memo.scanned;
+        if (!stable) ++memo.unstable;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - memo.reported > std::chrono::seconds(10)) {
+            memo.reported = now;
+            AgcDriver::ProfilePrint_nid_no_patch("[draw-dcc-memo] proved %llu scanned %llu unstable %llu entries %zu\n", memo.proved, memo.scanned, memo.unstable, memo.entries.size());
+        }
+    }
+    return keys;
+}
+
 void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident) {
     if (color.dccAddress == 0 || resident.Descriptor().dccAddress != color.dccAddress) return;
-    if (CurrentDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
+    if (ProvedDrawDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
     const char* refusal = nullptr;
     bool cleared = clearToTexel(resident, texel, color.elementBytes, refusal);
@@ -122,7 +189,7 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(color.dccAddress, keyBytes)) {
             Recorder::CountSync(2);
             recorder->SyncThrough(color.dccAddress, keyBytes);
-            if (CurrentDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
+            if (ProvedDrawDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
             cleared = clearToTexel(resident, texel, color.elementBytes, refusal);
         }
     }
@@ -137,7 +204,7 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
 bool materializeCmaskClear(const Context& context, const ColorTarget& color, StorageTexture* resident) {
     if (color.cmaskAddress == 0) return false;
     const auto metadataBytes = static_cast<std::uint64_t>(color.cmaskBytes) * 256u;
-    const auto state = CurrentDccKeys(color.cmaskAddress, metadataBytes);
+    const auto state = ProvedDrawDccKeys(color.cmaskAddress, metadataBytes);
     if (state == DccKeys::Uncompressed) return false;
     Require(color.dccAddress == 0, std::string("CMASK of a DCC color target that is not all expanded is not modeled (") + DccKeysName(state) + ")");
     Require(state == DccKeys::Clear0000, std::string("CMASK whose tiles are not all fast-cleared or all expanded is not modeled (") + DccKeysName(state) + ")");
@@ -184,8 +251,8 @@ TileMipLayout ColorTargetMip(const ColorTarget& color, const ColorTargetLayout& 
 
 // APS5_PROFILE_DRAW: per-draw phase timers in microseconds (a recorded draw's phases are far below
 // the millisecond the old print rounded to), totalled over 10 s in the [draws] line.
-enum DrawPhase : std::size_t { PhaseValidate, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseCount };
-constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
+enum DrawPhase : std::size_t { PhaseValidate, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseTargetRefresh, PhaseTargetView, PhaseCount };
+constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe", "targetRefresh", "targetView"};
 
 // Why a draw did not go into the recorder without a wait (counted in the [draws] line): its targets
 // are not all resident, no recorder is active, a switch (APS5_SYNC_DRAWS, APS5_DUMP_TARGETS,
@@ -583,6 +650,9 @@ bool MovableBuffers() {
 
 ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
     ResourceCache::Key key{0xffffffffu};
+    // Built anew for every recordable draw, so repeated growth reallocations are per-packet
+    // allocator work; the words and the lookup are unchanged.
+    key.reserve(8u + shaders.size() * 64u);
     const auto append64 = [&](std::uint64_t value) {
         key.push_back(static_cast<std::uint32_t>(value));
         key.push_back(static_cast<std::uint32_t>(value >> 32u));
@@ -1567,9 +1637,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
                 return resident;
             });
+            timer.phase(PhaseTargetRefresh);
         }
         if (binding.resident != nullptr) {
-            timer.phase(PhaseReadTarget);
+            timer.phase(PhaseTargetView);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
             targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice));
             continue;
@@ -1591,7 +1662,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
         // A fast-cleared DCC target holds its clear value wherever the draw does not write.
         if (color.dccAddress != 0) {
-            const auto keys = CurrentDccKeys(color.dccAddress, colorLayout.Bytes());
+            const auto keys = ProvedDrawDccKeys(color.dccAddress, colorLayout.Bytes());
             if (IsDccClear(keys)) {
                 const auto pixels = binding.gpuTiling ? binding.tiled->Bytes() : binding.transfer->Bytes();
                 if (keys == DccKeys::ClearRegister) {
@@ -1605,7 +1676,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 }
             }
         }
-        timer.phase(PhaseReadTarget);
+        timer.phase(PhaseTargetView);
         binding.target = std::make_unique<RenderTarget>(context, color, state.blends.at(color.exportIndex).blendEnable != 0);
         targetViews.push_back(binding.target->View());
     }
@@ -2158,7 +2229,7 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
             if (materializeCmaskClear(context, color, resident.get()) && resident != nullptr) resident->MarkDirty();
         }
         if (color.dccAddress == 0) continue;
-        auto keys = CurrentDccKeys(color.dccAddress, color.bytes);
+        auto keys = ProvedDrawDccKeys(color.dccAddress, color.bytes);
         if (keys == DccKeys::Uncompressed) continue;
         Require(IsDccClear(keys), std::string("CB metadata pass over DCC keys that are ") + DccKeysName(keys) + " (per-block metadata is not modeled)");
         const auto texel = clearTexel(color, keys);
