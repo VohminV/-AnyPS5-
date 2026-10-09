@@ -76,7 +76,8 @@ dist/
 coverage.xml
 .coverage
 htmlcov/
-
+Games/
+windows-diagnostics-imports.txt
 *.tmp
 *.log
 *.bak

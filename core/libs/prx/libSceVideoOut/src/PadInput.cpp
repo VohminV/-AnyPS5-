@@ -254,6 +254,19 @@ void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
         if (binding.control == Pad::InputControl::ToggleFullscreen) {
             if (keyboard && down && !pressed[index] && window.Handle() != nullptr && event.key.windowID == SDL_GetWindowID(window.Handle())) window.ToggleFullscreen();
         }
+        if (binding.control == Pad::InputControl::ToggleHelp && down && !pressed[index] && window.Handle() != nullptr) {
+            if (window.ShowingHelp()) {
+                window.SetHelpText({});
+            } else {
+                const auto help = Pad::DescribeBindings(bindings);
+                APS5_LOG_OUT("Pad: keyboard/mouse bindings: %s", help.c_str());
+                window.SetHelpText(help);
+                // Modal: the key release can land in the dialog, so never latch pressed here;
+                // the trailing pressed[index] = down below must be skipped as well.
+                window.ShowHelpDialog(Pad::DescribeBindingsFull(bindings));
+            }
+            continue;
+        }
         if (binding.control == Pad::InputControl::ToggleMouse && down && !pressed[index]) setMouseMode(!mouseEnabled);
         pressed[index] = down;
     }
@@ -334,6 +347,7 @@ void PadInput::publish() {
             case Pad::InputControl::TouchRight: state.touchRight = true; break;
             case Pad::InputControl::ToggleMouse: break;
             case Pad::InputControl::ToggleFullscreen: break;
+            case Pad::InputControl::ToggleHelp: break;
         }
     }
     for (std::size_t axis = 0; axis < state.sticks.size(); ++axis) {

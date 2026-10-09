@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #ifdef _WIN32
 #include "SDL_syswm.h"
@@ -76,6 +77,19 @@ void DisplayWindow::ToggleFullscreen() {
     require(SDL_SetWindowFullscreen(window, flags) == 0, SDL_GetError());
 }
 
+void DisplayWindow::SetHelpText(std::string text) {
+    helpText = std::move(text);
+}
+
+bool DisplayWindow::ShowingHelp() const {
+    return !helpText.empty();
+}
+
+void DisplayWindow::ShowHelpDialog(const std::string& body) {
+    require(window != nullptr, "window must exist before showing the help dialog");
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Keyboard and mouse bindings", body.c_str(), window);
+}
+
 void DisplayWindow::DrawableSize(std::uint32_t& width, std::uint32_t& height) const {
     if (window == nullptr) {
         width = 0;
@@ -105,8 +119,12 @@ void DisplayWindow::UpdateTitle() {
         fpsStart = now;
         fpsFrames = 0;
     }
-    char text[160];
-    std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu)", title.value, currentFps, static_cast<unsigned long long>(frameNum));
+    char text[512];
+    if (!helpText.empty()) {
+        std::snprintf(text, sizeof(text), "%s | FPS: %.2f | %s", title.value, currentFps, helpText.c_str());
+    } else {
+        std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu) | F1:Keys", title.value, currentFps, static_cast<unsigned long long>(frameNum));
+    }
     SDL_SetWindowTitle(window, text);
 }
 

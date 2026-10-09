@@ -324,7 +324,9 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
     case 7: stage = Stage::TessellationControl; programRegister = 0x108; resourceRegister = 0x10b; break;
     default: throw std::runtime_error("AGC driver: unsupported registered shader type");
     }
-    const auto high = RegisterValue(state.shader, programRegister + 1);
+    if (registration && state.shader.find(programRegister) == state.shader.end()) return {};
+    const auto highIt = state.shader.find(programRegister + 1);
+    const auto high = highIt == state.shader.end() ? 0u : highIt->second;
     if ((high & ~0xffu) != 0) throw std::runtime_error("AGC driver: invalid registered program address");
     const auto address = (static_cast<std::uint64_t>(RegisterValue(state.shader, programRegister)) << 8u) | (static_cast<std::uint64_t>(high) << 40u);
     if (address < snapshot.codeAddress || address - snapshot.codeAddress >= snapshot.code.size() * 4u) throw std::runtime_error("AGC driver: registered entry point is outside shader code");

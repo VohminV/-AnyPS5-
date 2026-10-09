@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 #include "SDL_scancode.h"
 #include "SDL_mouse.h"
@@ -17,6 +18,7 @@ inline constexpr double MouseSensitivity = 1.0;
 
 inline constexpr std::array InputMapping{
     InputBinding{SDL_SCANCODE_F11, MouseButton::None, InputControl::ToggleFullscreen},
+    InputBinding{SDL_SCANCODE_F1, MouseButton::None, InputControl::ToggleHelp},
     InputBinding{SDL_SCANCODE_RETURN, MouseButton::None, InputControl::Button, PadButton::Cross},
     InputBinding{SDL_SCANCODE_SPACE, MouseButton::None, InputControl::Button, PadButton::Cross},
     InputBinding{SDL_SCANCODE_ESCAPE, MouseButton::None, InputControl::Button, PadButton::Options},
@@ -52,6 +54,12 @@ inline constexpr std::array InputMapping{
 };
 
 std::vector<InputBinding> LoadInputMapping();
+
+// One-line-per-action description of keyboard/mouse bindings, in game order,
+// for the help line; sources of one action joined with '/'.
+std::string DescribeBindings(const std::vector<InputBinding>& bindings);
+// Full multi-line "Action: sources" table for the help dialog.
+std::string DescribeBindingsFull(const std::vector<InputBinding>& bindings);
 
 }
 

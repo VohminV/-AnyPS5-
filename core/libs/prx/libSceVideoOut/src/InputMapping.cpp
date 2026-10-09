@@ -50,7 +50,8 @@ constexpr auto actions = std::array{
     InputAction{"TouchLeft", Pad::InputControl::TouchLeft, Pad::PadButton::None},
     InputAction{"TouchRight", Pad::InputControl::TouchRight, Pad::PadButton::None},
     InputAction{"ToggleMouse", Pad::InputControl::ToggleMouse, Pad::PadButton::None},
-    InputAction{"ToggleFullscreen", Pad::InputControl::ToggleFullscreen, Pad::PadButton::None}
+    InputAction{"ToggleFullscreen", Pad::InputControl::ToggleFullscreen, Pad::PadButton::None},
+    InputAction{"ToggleHelp", Pad::InputControl::ToggleHelp, Pad::PadButton::None}
 };
 
 std::string upper(std::string_view value) {
@@ -183,4 +184,82 @@ std::vector<Pad::InputBinding> Pad::LoadInputMapping() {
     if (file.bad()) throw std::runtime_error("Pad: cannot read input mapping '" + path.string() + "'");
 
     return bindings;
+}
+
+constexpr std::string_view helpOrder[] = {"LeftStickLeft", "LeftStickRight", "LeftStickUp", "LeftStickDown",
+    "Cross", "Circle", "Square", "Triangle", "L1", "R1", "L2", "R2", "L3", "R3", "Options",
+    "Up", "Right", "Down", "Left", "RightStickLeft", "RightStickRight", "RightStickUp", "RightStickDown",
+    "TouchLeft", "TouchRight", "ToggleMouse", "ToggleFullscreen", "ToggleHelp"};
+
+static std::string bindingSourceName(const Pad::InputBinding& binding, bool compact) {
+    if (binding.key != SDL_SCANCODE_UNKNOWN) {
+        const char* name = SDL_GetScancodeName(binding.key);
+        if (name != nullptr && *name != '\0') return std::string(name);
+        return std::string("key#") + std::to_string(static_cast<int>(binding.key));
+    }
+    if (!compact) {
+        switch (binding.mouseButton) {
+            case Pad::MouseButton::Left: return std::string("Mouse Left");
+            case Pad::MouseButton::Middle: return std::string("Mouse Middle");
+            case Pad::MouseButton::Right: return std::string("Mouse Right");
+            case Pad::MouseButton::X1: return std::string("Mouse X1");
+            case Pad::MouseButton::X2: return std::string("Mouse X2");
+            default: break;
+        }
+        if (binding.wheelDirection > 0) return std::string("Wheel Up");
+        if (binding.wheelDirection < 0) return std::string("Wheel Down");
+        return std::string("?");
+    }
+    switch (binding.mouseButton) {
+        case Pad::MouseButton::Left: return std::string("MouseLeft");
+        case Pad::MouseButton::Middle: return std::string("MouseMiddle");
+        case Pad::MouseButton::Right: return std::string("MouseRight");
+        case Pad::MouseButton::X1: return std::string("MouseX1");
+        case Pad::MouseButton::X2: return std::string("MouseX2");
+        default: break;
+    }
+    if (binding.wheelDirection > 0) return std::string("WheelUp");
+    if (binding.wheelDirection < 0) return std::string("WheelDown");
+    return std::string("?");
+}
+
+std::string Pad::DescribeBindings(const std::vector<InputBinding>& bindings) {
+    std::string result = "Keys:";
+    for (const auto name : helpOrder) {
+        const auto* action = findAction(name);
+        if (action == nullptr) continue;
+        std::string sources;
+        for (const auto& binding : bindings) {
+            if (!matchesAction(binding, *action)) continue;
+            if (!sources.empty()) sources += '/';
+            sources += bindingSourceName(binding, true);
+            if (sources.size() > 40) break;
+        }
+        if (sources.empty()) continue;
+        result += ' ';
+        result += name;
+        result += ':';
+        result += sources;
+    }
+    return result;
+}
+
+std::string Pad::DescribeBindingsFull(const std::vector<InputBinding>& bindings) {
+    std::string result;
+    for (const auto name : helpOrder) {
+        const auto* action = findAction(name);
+        if (action == nullptr) continue;
+        std::string sources;
+        for (const auto& binding : bindings) {
+            if (!matchesAction(binding, *action)) continue;
+            if (!sources.empty()) sources += ", ";
+            sources += bindingSourceName(binding, false);
+        }
+        if (sources.empty()) continue;
+        result += name;
+        result += ": ";
+        result += sources;
+        result += '\n';
+    }
+    return result;
 }
