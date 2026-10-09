@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/CpuBackend/include/CpuBackend/Backend.hpp"
+#include <unordered_map>
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
@@ -108,6 +109,20 @@ void Driver::execute(const Submission& submission) {
                 thread_local unsigned long long shadowMisses = 0;
                 thread_local unsigned long long shadowFallbacks = 0;
                 thread_local auto shadowReported = std::chrono::steady_clock::now();
+                thread_local std::unordered_map<std::uint64_t, unsigned long long> submitHashCounts;
+                thread_local unsigned long long submitHashTotal = 0;
+                thread_local unsigned long long submitHashBest = 0;
+                {
+                    const std::uint64_t contentHash = AgcDriver::CpuBackend::Hash64Scalar(submission.commands.data(), submission.commands.size(), 0);
+                    if (submitHashCounts.size() >= 8192) {
+                        submitHashCounts.clear();
+                        submitHashTotal = 0;
+                        submitHashBest = 0;
+                    }
+                    const unsigned long long repeats = ++submitHashCounts[contentHash];
+                    ++submitHashTotal;
+                    if (repeats > submitHashBest) submitHashBest = repeats;
+                }
                 std::span<const std::uint32_t> shadowWords(submission.commands.data(), submission.commands.size());
                 AgcDriver::CpuBackend::SubmitStats shadowStats = shadowBackend.Submit(shadowWords);
                 ++shadowSubmissions;
@@ -122,6 +137,7 @@ void Driver::execute(const Submission& submission) {
                     shadowReported = shadowNow;
                     AgcDriver::ProfilePrint_nid_no_patch("[cpubackend] shadow %llu submissions %llu packets %llu hits %llu misses\n", static_cast<unsigned long long>(shadowSubmissions), static_cast<unsigned long long>(shadowPackets), static_cast<unsigned long long>(shadowHits), static_cast<unsigned long long>(shadowMisses));
                     AgcDriver::ProfilePrint_nid_no_patch("[cpubackend] shadow resources %llu fallbacks path %llu digest %llu\n", static_cast<unsigned long long>(shadowFallbacks), static_cast<unsigned long long>(static_cast<int>(shadowBackend.ActivePath())), static_cast<unsigned long long>(shadowBackend.LastDigest()));
+                    AgcDriver::ProfilePrint_nid_no_patch("[cpubackend] submit content %llu submissions %llu distinct best repeats %llu\n", static_cast<unsigned long long>(submitHashTotal), static_cast<unsigned long long>(submitHashCounts.size()), static_cast<unsigned long long>(submitHashBest));
                 }
             } catch (...) {
             }

@@ -2210,6 +2210,15 @@ namespace {
 std::size_t SnapshotPool(Recorder::SnapshotUse use) {
     return use == Recorder::SnapshotUse::Storage ? 0 : 1;
 }
+bool DrawSnapshotReuseEnabled() {
+    static const bool enabled = std::getenv("APS5_DRAW_SNAPSHOT_REUSE") != nullptr;
+    return enabled;
+}
+std::uint64_t snapshotContentHash(const std::byte* data, std::size_t bytes) {
+    std::uint64_t hash = 14695981039346656037ull;
+    for (std::size_t i = 0; i < bytes; ++i) hash = (hash ^ static_cast<std::uint64_t>(static_cast<unsigned char>(data[i]))) * 1099511628211ull;
+    return hash;
+}
 }
 
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
@@ -2232,6 +2241,50 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
     return found->second.buffer;
 }
 
+std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshotContent(std::uint64_t address, std::size_t bytes, std::uint64_t generation, SnapshotUse use, std::uint32_t* derived) {
+    if (!DrawSnapshotReuseEnabled()) return ReusableDrawSnapshot(address, bytes, use, derived);
+    auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
+    bool staleExact = false;
+    if (found != drawSnapshots.end() && std::get<0>(found->first) == address && std::get<1>(found->first) == use) {
+        if (found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
+            auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
+            recency.splice(recency.end(), recency, found->second.recent);
+            if (derived != nullptr) *derived = found->second.derived;
+            return found->second.buffer;
+        }
+        staleExact = true;
+    } else {
+        found = drawSnapshots.end();
+    }
+    if (bytes != 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes) && !SnapshotWriteOverlaps(address, bytes)) {
+        const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const std::uint64_t contentHash = snapshotContentHash(reinterpret_cast<const std::byte*>(address), bytes);
+        auto& pool = drawSnapshotPools[SnapshotPool(use)];
+        std::size_t visited = 0;
+        for (auto recent = pool.recency.rbegin(); recent != pool.recency.rend(); ++recent) {
+            if (++visited > 256) break;
+            const DrawSnapshotKey& key = *recent;
+            if (std::get<1>(key) != use || std::get<2>(key) != bytes) continue;
+            const auto candidate = drawSnapshots.find(key);
+            if (candidate == drawSnapshots.end() || candidate->second.contentHash == 0 || candidate->second.contentHash != contentHash) continue;
+            if (candidate->second.registryGeneration != registryGeneration) continue;
+            if (candidate->second.buffer == nullptr) continue;
+            const auto stored = candidate->second.buffer->Bytes();
+            if (stored.size() < bytes) continue;
+            bool equal = true;
+            for (std::size_t i = 0; equal && i < bytes; ++i) equal = stored[i] == reinterpret_cast<const std::byte*>(address)[i];
+            if (!equal) continue;
+            pool.recency.splice(pool.recency.end(), pool.recency, candidate->second.recent);
+            if (derived != nullptr) *derived = candidate->second.derived;
+            if (generation != 0) candidate->second.generation = generation;
+            if (staleExact && candidate != found) eraseDrawSnapshot(found);
+            return candidate->second.buffer;
+        }
+    }
+    if (staleExact) eraseDrawSnapshot(found);
+    return {};
+}
+
 void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
     const bool storage = use == SnapshotUse::Storage;
     const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
@@ -2246,8 +2299,13 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     while (!pool.recency.empty() && (pool.bytes + bytes > budget || pool.recency.size() >= maxEntries)) eraseDrawSnapshot(drawSnapshots.find(pool.recency.front()));
     const DrawSnapshotKey key{address, use, bytes};
     pool.recency.push_back(key);
+    std::uint64_t contentHash = 0;
+    if (DrawSnapshotReuseEnabled() && buffer != nullptr && bytes != 0) {
+        const auto kept = buffer->Bytes();
+        if (kept.size() >= bytes) contentHash = snapshotContentHash(kept.data(), bytes);
+    }
     try {
-        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived});
+        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived, contentHash});
     } catch (...) {
         pool.recency.pop_back();
         throw;

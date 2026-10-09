@@ -178,6 +178,20 @@ DccKeys ProvedDrawDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes)
     return keys;
 }
 
+void CountDrawReusable(ShaderResources::ReuseFail reason) {
+    static std::mutex reuseMutex;
+    static std::array<unsigned long long, static_cast<std::size_t>(ShaderResources::ReuseFail::Count)> reuseCounts{};
+    static auto reuseReported = std::chrono::steady_clock::now();
+    std::lock_guard lock(reuseMutex);
+    const auto index = static_cast<std::size_t>(reason);
+    if (index < reuseCounts.size()) ++reuseCounts[index];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reuseReported < std::chrono::seconds(10)) return;
+    reuseReported = now;
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-reusable] reusable %llu completion %llu lease %llu\n", reuseCounts[0], reuseCounts[1], reuseCounts[2]);
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-reusable] alloc %llu regions %llu serial %llu\n", reuseCounts[3], reuseCounts[4], reuseCounts[5]);
+}
+
 void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident) {
     if (color.dccAddress == 0 || resident.Descriptor().dccAddress != color.dccAddress) return;
     if (ProvedDrawDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
@@ -812,7 +826,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         GuestMemory::FlushGpuWrites(address, bytes);
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
-        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
+        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshotContent(address, bytes, copy.generation, use, &copy.derived);
         if (copy.buffer != nullptr) {
             copy.reused = true;
             return copy;
@@ -1789,7 +1803,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
-    if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
+    if (cacheable && built != nullptr && recorded) {
+        CountDrawReusable(resources->Reusable() ? ShaderResources::ReuseFail::Ok : resources->ReuseFailReason());
+        if (resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
+    }
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.

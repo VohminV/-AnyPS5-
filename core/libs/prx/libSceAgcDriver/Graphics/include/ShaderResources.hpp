@@ -175,6 +175,8 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
+    enum class ReuseFail : std::uint8_t { Ok, Completion, Lease, Alloc, Regions, Serial, Count };
+    ReuseFail ReuseFailReason() const { return reuseFail; }
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken
@@ -418,6 +420,7 @@ private:
     std::vector<std::shared_ptr<Sampler>> samplers;
     std::shared_ptr<Sampler> paddingSampler;
     bool reusable = false;
+    ReuseFail reuseFail = ReuseFail::Ok;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before

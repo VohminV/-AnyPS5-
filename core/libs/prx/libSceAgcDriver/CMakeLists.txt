@@ -480,6 +480,24 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+add_test_executable(agc_draw_snapshot_reuse_tests EXCLUDE_FROM_ALL tests/DrawSnapshotReuse.cpp)
+target_include_directories(agc_draw_snapshot_reuse_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_draw_snapshot_reuse_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_draw_snapshot_reuse_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_draw_snapshot_reuse_tests)
+if(MINGW)
+    target_compile_options(agc_draw_snapshot_reuse_tests PRIVATE -fasynchronous-unwind-tables)
+endif()
+if(BUILD_TESTING)
+    set_target_properties(agc_draw_snapshot_reuse_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_draw_snapshot_reuse COMMAND agc_draw_snapshot_reuse_tests)
+    set_tests_properties(agc_draw_snapshot_reuse PROPERTIES ENVIRONMENT "APS5_DRAW_SNAPSHOT_REUSE=1")
+    if(WIN32)
+        set_tests_properties(agc_draw_snapshot_reuse PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_driver_pm4_tests EXCLUDE_FROM_ALL
         tests/Pm4.cpp
 )

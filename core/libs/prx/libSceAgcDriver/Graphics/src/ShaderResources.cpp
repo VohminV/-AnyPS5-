@@ -1230,20 +1230,35 @@ void ShaderResources::noteReusable() {
     captureValidation();
     reusable = false;
     directRegions.clear();
-    if (NeedsCompletion() || HoldsLease()) return;
-    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return;
+    if (NeedsCompletion()) {
+        reuseFail = ReuseFail::Completion;
+        return;
+    }
+    if (HoldsLease()) {
+        reuseFail = ReuseFail::Lease;
+        return;
+    }
+    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) {
+        reuseFail = ReuseFail::Alloc;
+        return;
+    }
     const auto regions = guestMemory.DirectRegions();
-    if (!regions.has_value()) return;
+    if (!regions.has_value()) {
+        reuseFail = ReuseFail::Regions;
+        return;
+    }
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
         // against them.
         auto serial = HostImportSerial(context, begin, static_cast<std::size_t>(end - begin), false);
-        // Read-only image mirrors (exe ranges) are as stable as imports; their serials have the top
-        // bit set, so the two spaces never collide.
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
-        if (serial == 0) return;
+        if (serial == 0) {
+            reuseFail = ReuseFail::Serial;
+            return;
+        }
         directRegions.push_back({begin, end, serial});
     }
+    reuseFail = ReuseFail::Ok;
     reusable = true;
 }
 
@@ -2921,7 +2936,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
-        auto buffer = recorder.ReusableDrawSnapshot(begin, bytes);
+        auto buffer = recorder.ReusableDrawSnapshotContent(begin, bytes, generation);
         if (buffer == nullptr) {
             buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
