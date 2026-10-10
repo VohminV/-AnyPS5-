@@ -109,6 +109,15 @@ RefreshPhaseTotals& RefreshPhases() {
     static RefreshPhaseTotals phases;
     return phases;
 }
+// Streaming texture serialization mutex: serializes upload and writeback
+// for generation==0 (untracked/host-imported) surfaces to prevent races
+// between concurrent upload and writeback on the same memory region
+// (e.g., texture streaming during scene transitions). This prevents the
+// UUM-83271 class of TLSF allocator corruption from GPU/CPU races.
+// Recursive: Refresh may re-enter via FlushPending -> other texture's
+// writeBack on the same thread; the GpuMutex-held skip below avoids the
+// cross-thread streaming->Gpu vs Gpu->streaming order inversion.
+static std::recursive_mutex streamingTextureMutex;
 // Untracked-range rescue counters (permanent §3 measurement): snapshots
 // taken, rescues that fired, and which gate forbade the rest.
 std::atomic<std::uint64_t> untrackedSnapshots{0}, untrackedRescueHits{0}, untrackedRescueMemoHits{0};
@@ -1375,26 +1384,13 @@ bool StorageTexture::Refresh() {
         if (size == 0) {
             GuestUnifiedMemory::NoteFastSkip(GuestUnifiedMemory::FastSkip::NoGeneration);
         } else if (generation == 0) {
-            // Resident proof for untracked (write-watch-excluded, usually
-            // host-imported) surfaces. The global `generation` never advances
-            // here (CollectWrites returns 0), so the stamp fast-path below
-            // can never hit and every Refresh fell through to a full
-            // FlushPending + CollectWrites + DCC scan + write-back + upload.
-            // For a render target rewritten by the GPU every frame with no
-            // CPU writes, that is a full round-trip per use (the 22 GB upload
-            // / 16 GB write-back per 10 s window).
-            //
-            // This path does NOT fake a non-zero generation and does NOT treat
-            // MarkDirty() as proof of a completed GPU write. It distinguishes:
-            // write state (pending flags, self-exempt), content version
-            // (bumped on every MarkDirty/upload, which moves the pending
-            // serial and forces a re-compare) and resident validity (snapshot
-            // bytes + epoch/serial/forget/keys memo + owner identity + keys).
-            // Every GPU write from another image (foreign pending), CPU write
-            // (byte-compare miss), alias borrow, backing-resource change
-            // (owner/forget serial) or unproved keys falls through to the
-            // existing slow path. APS5_NO_REFRESH_FAST_PATH=1 disables this
-            // together with the stamp fast-path and the snapshot/rescue.
+            // Narrow fast-path guard for gen==0 snapshot/memo/owner state.
+            // Skipped when the GpuMutex is already held (FlushPending path):
+            // the GpuMutex then serializes, avoiding streaming->Gpu vs
+            // Gpu->streaming order inversion. Slow path below runs without
+            // this lock (its FlushPending/CollectWrites have their own).
+            std::unique_lock<std::recursive_mutex> streamingLock(streamingTextureMutex, std::defer_lock);
+            if (!GuestMemory::GpuMutex().HeldByThisThread()) streamingLock.lock();
             const bool snapshotValid = untrackedSnapshotValid && original.size() == size;
             const bool hasBorrowed = std::any_of(borrowedUnits.begin(), borrowedUnits.end(), [](bool held) { return held; });
             DccKeys fastKeys = DccKeys::Uncompressed;
@@ -1972,6 +1968,15 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         // are copied, and write tracking alone validates the image (a change re-runs this).
         originalValid = false;
         stampLayers(true);
+        // Serialize upload for streaming textures (generation == 0) to prevent
+        // races with concurrent writeback on the same memory region.
+        // Skip locking if called from Refresh (which already holds the lock)
+        // or under the GpuMutex (FlushPending path relies on it; avoids
+        // streaming->Gpu vs Gpu->streaming order inversion).
+        // Respect APS5_NO_REFRESH_FAST_PATH kill switch (disables fast path AND streaming mutex).
+        static const bool fastRefresh = std::getenv("APS5_NO_REFRESH_FAST_PATH") == nullptr;
+        std::unique_lock<std::recursive_mutex> streamingLock(streamingTextureMutex, std::defer_lock);
+        if (fastRefresh && generation == 0 && refreshing != this && !GuestMemory::GpuMutex().HeldByThisThread()) streamingLock.lock();
         // A whole-surface upload of a block-unit image goes through the windows too when a unit
         // shadow holds part of the surface (the detile then reads the slabs; a new image has no
         // layout yet); a partial one always does.
@@ -2094,6 +2099,10 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     // `original` is compare-only in both paths (uploads always re-read), the
     // rescue never uses it as an upload base, and the kill switch disables
     // this together with everything else.
+    // Respect APS5_NO_REFRESH_FAST_PATH kill switch (disables fast path AND streaming mutex).
+    static const bool fastRefresh = std::getenv("APS5_NO_REFRESH_FAST_PATH") == nullptr;
+    std::unique_lock<std::recursive_mutex> streamingLock(streamingTextureMutex, std::defer_lock);
+    if (fastRefresh && generation == 0 && refreshing != this && !GuestMemory::GpuMutex().HeldByThisThread()) streamingLock.lock();
     if (generation == 0 && UntrackedSnapshotEnabled()) {
         untrackedSnapshotValid = true;
         untrackedSnapshotForgetSerial = GuestMemory::ForgetSerial();
@@ -3842,6 +3851,15 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         PhaseTimer& timer;
         ~Account() { if (enabled) Profile().storageWriteBack += timer.lap(); }
     } account{profile, timer};
+    // Serialize writeback for streaming textures (generation == 0) to prevent
+    // races with concurrent upload on the same memory region.
+    // Skip locking if called from Refresh (which already holds the lock)
+    // or under the GpuMutex (FlushPending path relies on it; avoids
+    // streaming->Gpu vs Gpu->streaming order inversion).
+    // Respect APS5_NO_REFRESH_FAST_PATH kill switch (disables fast path AND streaming mutex).
+    static const bool fastRefresh = std::getenv("APS5_NO_REFRESH_FAST_PATH") == nullptr;
+    std::unique_lock<std::recursive_mutex> streamingLock(streamingTextureMutex, std::defer_lock);
+    if (fastRefresh && generation == 0 && refreshing != this && !GuestMemory::GpuMutex().HeldByThisThread()) streamingLock.lock();
     // Whatever the outcome, the registration follows the pending flags (a throw leaves the
     // layers pending).
     struct Reconcile {
@@ -3871,6 +3889,23 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         originalValid = false;
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) layerPending[layer] = false;
         return;
+    }
+    // TLSF-level reuse guard for generation==0 (untracked) surfaces: the OS-level
+    // owner check above cannot see an in-game heap free/realloc inside the same
+    // mapped arena (Unity TLSF pop reads before writing, so write-watch stamps
+    // stay silent). Storing stale GPU texels over the new owner's live bytes
+    // corrupts it (UUM-83271: free-list pointer becomes 0xffffffffffffffff).
+    // `original` holds the bytes last uploaded/written; if the guest no longer
+    // matches, the CPU (or a reuse) won and pending results are dropped.
+    if (unregisteredDrop && generation == 0 && !original.empty() && original.size() == static_cast<std::size_t>(guestBytes)) {
+        if (GuestMemory::CompareMapped(descriptor.baseAddress, std::span<const std::byte>(original)) != GuestMemory::Compare::Equal) {
+            static std::atomic<int> reuseReports{0};
+            if (reuseReports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx+0x%llx: guest differs from snapshot, dropping stale results (TLSF reuse guard)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes));
+            ownerReusedDropped.fetch_add(1, std::memory_order_relaxed);
+            originalValid = false;
+            for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) layerPending[layer] = false;
+            return;
+        }
     }
     const auto elementBytes = BytesPerElement(descriptor.format);
     // 64 KiB blocks the CPU wrote since the layer was last in sync keep the CPU's bytes: the game
