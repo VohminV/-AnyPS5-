@@ -18,6 +18,28 @@ namespace {
 
 // The reporter runs on a faulting thread that may itself hold the CRT stream lock (a fault inside
 // printf), so it writes straight to the stderr handle.
+void ReportToFile(const char* data, DWORD length) {
+    // Best-effort append beside the executable: stderr is lost when the title
+    // is started without a console (double-click, launcher without capture).
+    wchar_t exe[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    wchar_t* slash = nullptr;
+    for (wchar_t* cursor = exe; *cursor; ++cursor) {
+        if (*cursor == L'\\' || *cursor == L'/') slash = cursor;
+    }
+    if (!slash) return;
+    *slash = L'\0';
+    wchar_t path[MAX_PATH + 16];
+    _snwprintf(path, sizeof(path) / sizeof(path[0]), L"%s\\crash.log", exe);
+    path[MAX_PATH + 15] = L'\0';
+    HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(file, data, length, &written, nullptr);
+    CloseHandle(file);
+}
+
 void Report(const char* format, ...) {
     char buffer[1024];
     va_list args;
@@ -28,6 +50,7 @@ void Report(const char* format, ...) {
     if (length > static_cast<int>(sizeof(buffer)) - 1) length = sizeof(buffer) - 1;
     DWORD written = 0;
     WriteFile(GetStdHandle(STD_ERROR_HANDLE), buffer, static_cast<DWORD>(length), &written, nullptr);
+    ReportToFile(buffer, static_cast<DWORD>(length));
 }
 
 void ReportAllThreads();
@@ -238,6 +261,91 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+// Flight recorder (see CrashNotes.hpp): the last thing every module did
+// before the death, dumped below. Fixed ring, no heap, no locks; one atomic
+// increment and bounded copies per note. A torn entry can garble text but the
+// dump reads with bounded lengths, so it cannot crash the reporter.
+namespace CrashFlight {
+constexpr std::size_t kSlots = 512;
+constexpr std::size_t kTag = 16;
+constexpr std::size_t kText = 112;
+struct Slot {
+    std::atomic<std::uint64_t> serial{0};
+    char tag[kTag]{};
+    char text[kText]{};
+};
+Slot flight[kSlots];
+std::atomic<std::uint64_t> flightNext{1};
+
+bool NotesEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_CRASH_NOTES") != nullptr;
+    return !disabled;
+}
+
+void CopyBounded(char* destination, std::size_t capacity, const char* source) {
+    if (source == nullptr) source = "?";
+    std::size_t i = 0;
+    while (i + 1 < capacity && source[i] != '\0') {
+        destination[i] = source[i];
+        ++i;
+    }
+    destination[i] = '\0';
+}
+
+void AddNote(const char* tag, const char* text) {
+    if (!NotesEnabled()) return;
+    const auto serial = flightNext.fetch_add(1, std::memory_order_relaxed);
+    auto& slot = flight[serial % kSlots];
+    CopyBounded(slot.tag, kTag, tag);
+    CopyBounded(slot.text, kText, text);
+    slot.serial.store(serial, std::memory_order_release);
+}
+
+void AddNotef(const char* tag, const char* format, va_list args) {
+    if (!NotesEnabled()) return;
+    const auto serial = flightNext.fetch_add(1, std::memory_order_relaxed);
+    auto& slot = flight[serial % kSlots];
+    CopyBounded(slot.tag, kTag, tag);
+    if (format == nullptr) {
+        slot.text[0] = '\0';
+    } else {
+        // vsnprintf is fine here: this runs on normal paths, never inside the handler.
+        std::vsnprintf(slot.text, kText, format, args);
+        slot.text[kText - 1] = '\0';
+    }
+    slot.serial.store(serial, std::memory_order_release);
+}
+
+void DumpNotes() {
+    const auto newest = flightNext.load(std::memory_order_acquire);
+    const auto oldest = newest > 96 ? newest - 96 : 1;
+    Report("  flight recorder: notes %llu..%llu (oldest first):\n", static_cast<unsigned long long>(oldest), static_cast<unsigned long long>(newest > 1 ? newest - 1 : 0));
+    for (auto serial = oldest; serial < newest; ++serial) {
+        const auto& slot = flight[serial % kSlots];
+        if (slot.serial.load(std::memory_order_acquire) != serial) continue;
+        if (slot.tag[0] == '\0') continue;
+        char tag[kTag], text[kText];
+        std::memcpy(tag, slot.tag, kTag);
+        std::memcpy(text, slot.text, kText);
+        tag[kTag - 1] = '\0';
+        text[kText - 1] = '\0';
+        Report("    #%llu %s %s\n", static_cast<unsigned long long>(serial), tag, text);
+    }
+}
+
+} // namespace CrashFlight
+
+extern "C" void CrashNote_nid_no_patch(const char* tag, const char* text) {
+    CrashFlight::AddNote(tag, text);
+}
+
+extern "C" void CrashNotef_nid_no_patch(const char* tag, const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    CrashFlight::AddNotef(tag, format, args);
+    va_end(args);
+}
+
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
@@ -271,6 +379,16 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
         const char* kind = record->ExceptionInformation[0] == 0 ? "read" : record->ExceptionInformation[0] == 1 ? "write" : "execute";
         Report("  %s of 0x%016llx\n", kind, static_cast<unsigned long long>(record->ExceptionInformation[1]));
+        // Guest arena membership for the fault address: distinguishes an
+        // unmapped access from corruption inside mapped guest memory.
+        std::uintptr_t arenaBase = 0;
+        std::size_t arenaBytes = 0;
+        GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+        if (arenaBytes != 0) {
+            const auto fault = static_cast<std::uintptr_t>(record->ExceptionInformation[1]);
+            if (fault >= arenaBase && fault < arenaBase + arenaBytes) Report("  inside guest arena +0x%llx\n", static_cast<unsigned long long>(fault - arenaBase));
+            else Report("  outside guest arena [0x%llx, 0x%llx)\n", static_cast<unsigned long long>(arenaBase), static_cast<unsigned long long>(arenaBase + arenaBytes));
+        }
     }
     Report("  rax %016llx rbx %016llx rcx %016llx rdx %016llx\n", context->Rax, context->Rbx, context->Rcx, context->Rdx);
     Report("  rsi %016llx rdi %016llx rbp %016llx rsp %016llx\n", context->Rsi, context->Rdi, context->Rbp, context->Rsp);
@@ -333,6 +451,8 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
             }
         }
     }
+    std::fflush(stderr);
+    CrashFlight::DumpNotes();
     std::fflush(stderr);
     ReportAllThreads();
     std::fflush(stderr);
@@ -438,12 +558,21 @@ DWORD WINAPI HangWatchdog(LPVOID param) {
 void ReportBacktrace(const char* what, bool reportThreads) {
     void* frames[48];
     const auto count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
-    Report("FATAL: %s on thread %lu\n", what, static_cast<unsigned long>(GetCurrentThreadId()));
+    char threadName[128] = "";
+    PWSTR description = nullptr;
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)) && description) {
+        WideCharToMultiByte(CP_UTF8, 0, description, -1, threadName, sizeof(threadName), nullptr, nullptr);
+        LocalFree(description);
+    }
+    Report("FATAL: %s on thread %lu '%s'\n", what, static_cast<unsigned long>(GetCurrentThreadId()), threadName);
     char line[256];
     for (USHORT i = 0; i < count; ++i) {
         DescribeAddress(reinterpret_cast<std::uint64_t>(frames[i]), line, sizeof(line));
         Report("    #%u %s\n", static_cast<unsigned>(i), line);
     }
+    // The flight recorder is the only trace of what led here: an abort after
+    // a failed operation names no fault address, so dump the last notes.
+    CrashFlight::DumpNotes();
     if (reportThreads) ReportAllThreads();
     std::fflush(stderr);
 }
@@ -484,4 +613,8 @@ const bool g_crashReportInstalled = [] {
 }();
 
 }
+#else
+// Non-Windows builds: the flight recorder is a no-op (the crash reporter is Windows-only).
+extern "C" void CrashNote_nid_no_patch(const char*, const char*) {}
+extern "C" void CrashNotef_nid_no_patch(const char*, const char*, ...) {}
 #endif

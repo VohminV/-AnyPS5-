@@ -142,6 +142,33 @@ void CheckUnwatch() {
     Require(!UnchangedSince(base, Block, adjacent), "unwatch hid a CPU edit in unrelated memory");
 }
 
+void CheckTrackedNeverZero() {
+    // Regression test for the resident-proof contract in StorageTexture::Refresh:
+    // 0 is the untracked sentinel (CollectWrites returns it exactly when nothing
+    // was tracked). A tracked collect or store must never produce it — not even
+    // across the 32-bit tracker wrap, which skips 0 — or tracked content would
+    // read as untracked and every use would re-upload. Generation must reflect
+    // real content changes: UnchangedSince holds until a genuine write lands.
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    Require(TrackerGeneration() != 0, "the tracker starts at the untracked sentinel");
+    for (int round = 0; round < 3; ++round) {
+        const auto synced = CollectWrites(base, 2 * Block);
+        Require(synced != 0, "a tracked collect returned the untracked sentinel");
+        Require(UnchangedSince(base, 2 * Block, synced), "a tracked range reads as changed at its own generation");
+        Require(!UnchangedSince(base, Block, 0), "generation 0 reads as unchanged on tracked memory");
+        const auto stamped = MarkWritten(base, Block);
+        Require(stamped != 0, "a tracked driver store returned the untracked sentinel");
+        Require(!UnchangedSince(base, Block, synced), "a driver store into watched memory is not seen");
+        Require(UnchangedSince(base + Block, Block, synced), "a store in one block invalidated its neighbour");
+        const auto recollected = CollectWritesUncached(base, 2 * Block);
+        Require(recollected != 0, "a tracked recollect returned the untracked sentinel");
+        Require(UnchangedSince(base, 2 * Block, recollected), "a tracked range reads as changed right after its own walk");
+    }
+    Require(TrackerGeneration() != 0, "the tracker reached the untracked sentinel");
+}
+
 #ifdef _WIN32
 void CheckPrivateMappingReuse() {
     void* memory = AllocateWatched(3 * Block);
@@ -186,6 +213,7 @@ int main() {
         CheckSharedBlock();
         CheckOwnStore();
         CheckUnwatch();
+        CheckTrackedNeverZero();
 #ifdef _WIN32
         CheckPrivateMappingReuse();
 #endif

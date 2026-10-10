@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestUnifiedMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include <algorithm>
 #include <bit>
@@ -22,6 +23,21 @@ BufferPool::BufferPool(const Context& context) : device(context.device), unmap(c
     smallTier.budget = smallBudget;
     largeTier.budget = budget;
     deviceTier.budget = DeviceBudget();
+    // UMA capability probe, once per process: real heaps/types, no assumptions.
+    // A 256MiB BAR is reported as 256MiB, never inflated into ReBAR==full VRAM.
+    static bool probed = false;
+    if (!probed) {
+        probed = true;
+        const auto caps = GuestUnifiedMemory::ProbeCapabilities(
+            context.memory, context.limits, context.bufferDeviceAddress);
+        std::fprintf(stderr,
+                     "[uma] caps: BAR %lluMiB%s bda %d atom %zu heaps %u types %u deviceTier %lluMiB\n",
+                     static_cast<unsigned long long>(caps.barBytes >> 20),
+                     caps.resizableBar ? " (ReBAR)" : "", caps.hasBufferDeviceAddress ? 1 : 0,
+                     caps.nonCoherentAtomSize, context.memory.memoryHeapCount,
+                     context.memory.memoryTypeCount,
+                     static_cast<unsigned long long>(DeviceBudget() >> 20));
+    }
 }
 
 BufferPool::~BufferPool() {
@@ -35,7 +51,11 @@ BufferPool::~BufferPool() {
 VkDeviceSize BufferPool::DeviceBudget() {
     static const VkDeviceSize deviceBudget = [] {
         const char* value = std::getenv("APS5_STAGING_POOL_MIB");
-        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 512ull) << 20u;
+        // Hacker default: 768MiB on desktop GPUs (>=6GB VRAM class like RTX 3050 8GB).
+        // 512 thrashed on Silksong (5000 evictions/10s, each a create/destroy under
+        // the pool mutex). RDNA2 hides this spill in L2/Infinity Cache; on NVIDIA
+        // we keep it resident instead. Override with APS5_STAGING_POOL_MIB.
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 768ull) << 20u;
     }();
     return deviceBudget;
 }

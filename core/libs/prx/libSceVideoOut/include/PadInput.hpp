@@ -5,7 +5,6 @@
 #include "SDL_gamecontroller.h"
 #include "prx/libScePad/include/InputMapping.hpp"
 #include "prx/libScePad/include/PadState.hpp"
-#include <array>
 #include <chrono>
 #include <vector>
 
@@ -20,7 +19,6 @@ public:
 
 private:
     void publish();
-    void setMouseMode(bool enabled);
     void openFirstAvailableController();
     void openController(int deviceIndex);
     void closeController();
@@ -29,11 +27,6 @@ private:
     void enableSensors();
 
     std::vector<Pad::InputBinding> bindings;
-    std::vector<bool> pressed;
-    std::vector<std::chrono::steady_clock::time_point> wheelReleaseTimes;
-    std::array<std::uint8_t, 2> mouseStick{128, 128};
-    std::chrono::steady_clock::time_point nextMousePoll{};
-    bool mouseEnabled = false;
     SDL_GameController* controller = nullptr;
     PadInputState controllerState{};
     std::uint32_t outputSequence = 0;

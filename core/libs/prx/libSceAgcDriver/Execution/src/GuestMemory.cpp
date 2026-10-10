@@ -18,6 +18,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -111,6 +112,12 @@ std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
+// Why collectWrites returns 0 (which forces every consumer onto its slow
+// path and keeps image generations at 0). No behavior change: pure counters,
+// reported with the [guestmem] line.
+std::atomic<std::uint64_t> collectZeroUnwatched{0};
+std::atomic<std::uint64_t> collectZeroRange{0};
+std::atomic<std::uint64_t> collectZeroWalk{0};
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -334,6 +341,7 @@ public:
         }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" collect-zero unwatched %llu range %llu walk %llu", static_cast<unsigned long long>(collectZeroUnwatched.load()), static_cast<unsigned long long>(collectZeroRange.load()), static_cast<unsigned long long>(collectZeroWalk.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
             std::lock_guard lock(state.callersMutex);
@@ -701,7 +709,11 @@ std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable) {
     require(alignment != 0, "zero guest memory alignment");
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
-    require(address != 0 && address % alignment == 0, "null or misaligned address");
+    if (address == 0 || address % alignment != 0) {
+        char text[192];
+        std::snprintf(text, sizeof(text), "null or misaligned address 0x%llx (bytes 0x%zx, alignment 0x%zx, writable %d) from +0x%llx", static_cast<unsigned long long>(address), bytes, alignment, writable ? 1 : 0, ModuleOffset(__builtin_return_address(0)));
+        throw std::runtime_error(std::string("AGC driver: ") + text);
+    }
     require(bytes <= std::numeric_limits<std::uintptr_t>::max() - address, "address range overflow");
     const auto reason = verify(address, bytes, writable);
     if (!reason.empty()) {
@@ -732,7 +744,11 @@ Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writ
         }
         return true;
     });
-    require(queried, "cannot query guest memory");
+    if (!queried) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "cannot query guest memory at 0x%llx+0x%zx", static_cast<unsigned long long>(address), bytes);
+        require(false, text);
+    }
     result.whole = bytes == 0 || (result.ranges.size() == 1 && result.ranges.front().first == address && result.ranges.front().second == address + bytes);
     return result;
 }
@@ -961,7 +977,11 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
     const auto lock = lockTracker(tracker);
     if (!tracker.watched || bytes == 0 || bytes > tracker.size || address < tracker.base || address - tracker.base > tracker.size - bytes) return;
     tracker.coverage.Restore(address, bytes, generation);
-    ++tracker.generation;
+    // Generation 0 is reserved for "untracked" (CollectWrites returns 0 when
+    // nothing was tracked): never leave a tracked stamp at 0 across the
+    // 32-bit wrap, or the next UnchangedSince would mistake tracked content
+    // for untracked and every user would re-upload until the following bump.
+    if (++tracker.generation == 0) ++tracker.generation;
     for (auto block = tracker.blockOf(address); block <= tracker.blockOf(address + bytes - 1); ++block) {
         tracker.driverPieces.erase(block);
         tracker.stamp(block, tracker.generation, StampKind::Cpu);
@@ -1020,7 +1040,8 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
 #endif
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind) {
-    ++tracker.generation;
+    // See watchPrivateMapping: 0 stays reserved for untracked.
+    if (++tracker.generation == 0) ++tracker.generation;
 #ifdef _WIN32
     constexpr std::uint64_t page = 4096;
     // One resetting walk: the kernel reports and clears a page's dirty bit together, a write landing
@@ -1099,7 +1120,14 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
+    if (!tracker.watched) {
+        collectZeroUnwatched.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) {
+        collectZeroRange.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
@@ -1110,7 +1138,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const TimedAccess timed(CounterCollect, bytes);
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
+        collectZeroWalk.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
@@ -1222,11 +1253,119 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     return true;
 }
 
+namespace MemJournal {
+// Diagnostic write journal (APS5_MEM_JOURNAL=1): one fixed record per host
+// store into guest memory — CPU stores via storeOwn below, GPU-reported
+// stores via MarkWritten. Bounded ring, no allocation; the only file IO is a
+// background flush every few seconds, never on the store path. Default off:
+// one branch per store when disabled. Callers hold the tracker lock while
+// recording, so writers never race each other; the flusher validates each
+// slot with a seqlock-style sequence check. Coverage limit: stores the
+// engine does not report (raw guest writes by game code, unreported GPU
+// copies into import-backed images) never appear here — absence from the
+// journal exonerates the host paths, it does not prove the guest innocent.
+struct Event {
+    std::atomic<std::uint64_t> seq{0};
+    std::uint64_t thread = 0;
+    std::uint32_t kind = 0; // 0 = CPU store, 1 = GPU-reported store
+    std::uint64_t address = 0;
+    std::uint64_t size = 0;
+    std::uint64_t caller = 0;
+};
+constexpr std::size_t kSize = 1u << 16;
+Event ring[kSize];
+std::atomic<std::uint64_t> head{0};
+
+bool On() {
+    static const bool on = std::getenv("APS5_MEM_JOURNAL") != nullptr;
+    return on;
+}
+
+#ifdef _WIN32
+void DescribeModule(std::uint64_t address, char* out, std::size_t outSize) {
+    HMODULE module = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(address), &module) && module) {
+        char path[MAX_PATH] = "?";
+        GetModuleFileNameA(module, path, sizeof(path));
+        const char* name = path;
+        for (const char* cursor = path; *cursor; ++cursor) {
+            if (*cursor == '\\' || *cursor == '/') name = cursor + 1;
+        }
+        std::snprintf(out, outSize, "%s+0x%llx", name, static_cast<unsigned long long>(address - reinterpret_cast<std::uint64_t>(module)));
+        return;
+    }
+    std::snprintf(out, outSize, "0x%llx", static_cast<unsigned long long>(address));
+}
+#endif
+
+void FlushLoop() {
+    wchar_t exe[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    wchar_t* slash = nullptr;
+    for (wchar_t* cursor = exe; *cursor; ++cursor) {
+        if (*cursor == L'\\' || *cursor == L'/') slash = cursor;
+    }
+    if (slash == nullptr) return;
+    *slash = L'\0';
+    wchar_t path[MAX_PATH + 32];
+    _snwprintf(path, sizeof(path) / sizeof(path[0]), L"%s\\memjournal.log", exe);
+    path[MAX_PATH + 31] = L'\0';
+    {
+        FILE* file = _wfopen(path, L"w");
+        if (file == nullptr) return;
+        std::fprintf(file, "# memjournal ring=%zu fields: seq kind(0=cpu,1=gpu) thread address size caller\n", kSize);
+        std::fclose(file);
+    }
+    std::uint64_t flushed = 0;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        const auto now = head.load(std::memory_order_acquire);
+        if (now == flushed) continue;
+        FILE* file = _wfopen(path, L"a");
+        if (file == nullptr) {
+            flushed = now;
+            continue;
+        }
+        for (auto seq = flushed; seq < now; ++seq) {
+            auto& slot = ring[seq & (kSize - 1)];
+            if (slot.seq.load(std::memory_order_acquire) != seq) continue; // overwritten or torn
+            char caller[128];
+#ifdef _WIN32
+            DescribeModule(slot.caller, caller, sizeof(caller));
+#else
+            std::snprintf(caller, sizeof(caller), "0x%llx", static_cast<unsigned long long>(slot.caller));
+#endif
+            std::fprintf(file, "%llu %u %llx 0x%llx %llu %s\n", static_cast<unsigned long long>(seq), slot.kind, static_cast<unsigned long long>(slot.thread), static_cast<unsigned long long>(slot.address), static_cast<unsigned long long>(slot.size), caller);
+        }
+        std::fclose(file);
+        flushed = now;
+    }
+}
+
+void Record(std::uint64_t address, std::size_t size, std::uint32_t kind, std::uint64_t caller) {
+    if (!On()) return;
+    static std::once_flag flusher;
+    std::call_once(flusher, [] { std::thread(FlushLoop).detach(); });
+    const auto seq = head.fetch_add(1, std::memory_order_relaxed);
+    auto& slot = ring[seq & (kSize - 1)];
+    slot.thread = static_cast<std::uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    slot.kind = kind;
+    slot.address = address;
+    slot.size = size;
+    slot.caller = caller;
+    slot.seq.store(seq, std::memory_order_release);
+}
+} // namespace MemJournal
+
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
+    // Diagnostic write journal (APS5_MEM_JOURNAL=1, see MemJournal below).
+    MemJournal::Record(address, bytes, /*kind=*/0, reinterpret_cast<std::uint64_t>(__builtin_return_address(0)));
     if (bytes == 0) return 0;
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first || !tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) return 0;
-        ++tracker.generation;
+        // See watchPrivateMapping: 0 stays reserved for untracked.
+        if (++tracker.generation == 0) ++tracker.generation;
         for (auto block = tracker.blockOf(stored.first); block <= tracker.blockOf(stored.second - 1); ++block) {
             tracker.stamp(block, tracker.generation, StampKind::Driver);
             tracker.noteDriverStore(block, stored.first, stored.second, tracker.generation);
@@ -1257,13 +1396,15 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std:
 }
 
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+    MemJournal::Record(address, bytes, /*kind=*/1, reinterpret_cast<std::uint64_t>(__builtin_return_address(0)));
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || bytes == 0 || !tracker.covers(address, bytes)) return 0;
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(address + bytes - 1);
-    ++tracker.generation;
+    // See watchPrivateMapping: 0 stays reserved for untracked.
+    if (++tracker.generation == 0) ++tracker.generation;
     for (auto block = first; block <= last; ++block) {
         tracker.stamp(block, tracker.generation, StampKind::Driver);
         tracker.noteDriverStore(block, address, address + bytes, tracker.generation);

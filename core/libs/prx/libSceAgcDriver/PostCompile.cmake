@@ -16,6 +16,14 @@ foreach(agcTarget IN ITEMS libSceAgcDriver agc_driver_visual_test agc_driver_gra
     endif()
 endforeach()
 
+# GuestUnifiedMemory: libSceAgcDriver and mesh already get it via agcDriverSources;
+# the source-compiling test targets need it explicitly (Texture/BufferPool call in).
+foreach(agcTarget IN ITEMS agc_driver_visual_test agc_driver_graphics_tests agc_driver_bda_device_tests)
+    if(TARGET ${agcTarget})
+        target_sources(${agcTarget} PRIVATE Execution/src/GuestUnifiedMemory.cpp)
+    endif()
+endforeach()
+
 foreach(agcTarget IN ITEMS libSceAgcDriver agc_driver_visual_test agc_driver_graphics_tests agc_driver_mesh_tests)
     if(TARGET ${agcTarget})
         target_sources(${agcTarget} PRIVATE Graphics/src/TextureDetilerDescriptors.cpp Graphics/src/TextureCache.cpp)

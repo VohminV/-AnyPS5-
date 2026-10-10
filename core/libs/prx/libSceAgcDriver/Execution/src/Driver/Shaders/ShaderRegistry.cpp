@@ -182,6 +182,17 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
         snapshot.prepared->entries.push_back({codeOffset, handle});
         return handle;
     }
+    // On-demand prepare for a registered program asked with a static ABI no
+    // prepared entry covers yet (new wave/push-layout combo at runtime, e.g.
+    // mesh shaders in new scenes): same as the unregistered path above, then
+    // cached. A genuinely unpreparable ABI still throws below, unchanged.
+    try {
+        auto handle = ShaderRecompiler::PrepareShader(request);
+        snapshot.prepared->entries.push_back({codeOffset, handle});
+        return handle;
+    } catch (const std::exception& error) {
+        APS5_LOG_ERR("On-demand prepare failed for 0x%llx: %s", static_cast<unsigned long long>(snapshot.codeAddress), error.what());
+    }
     std::string layouts;
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset != codeOffset || entry.handle == nullptr || entry.handle->artifact == nullptr) continue;
@@ -226,6 +237,21 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
         if (!invocation.has_value()) throw std::runtime_error("AGC driver: raw compute artifact does not match its invocation");
         snapshot.prepared->entries.push_back({codeOffset, std::move(handle)});
         return std::move(*invocation);
+    }
+    // Same on-demand prepare as above for a new static ABI of a registered
+    // program (see SourceHandleFor): prepare, cache, and build the invocation
+    // from the fresh artifact instead of dying.
+    try {
+        auto handle = ShaderRecompiler::PrepareShader(request);
+        invocationRequest = request;
+        invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
+        if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key)) {
+            snapshot.prepared->entries.push_back({codeOffset, std::move(handle)});
+            return std::move(*invocation);
+        }
+        APS5_LOG_ERR("On-demand prepared invocation mismatch for 0x%llx", static_cast<unsigned long long>(snapshot.codeAddress));
+    } catch (const std::exception& error) {
+        APS5_LOG_ERR("On-demand prepare failed for 0x%llx: %s", static_cast<unsigned long long>(snapshot.codeAddress), error.what());
     }
     std::string layouts;
     for (const auto& entry : snapshot.prepared->entries) {

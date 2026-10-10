@@ -6,13 +6,50 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <new>
 #include <stdexcept>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
+    // Playable rule: menu/cutscene phases issue compute dispatches without a
+    // programmed compute program (shader 0x20c never written). Without the
+    // program address there is nothing to run: skip like a rejected draw
+    // (counted in the [packets] "skipped" outcome, packet loop continues)
+    // instead of terminating the process. Strict mode (APS5_STRICT_DISPATCH=1)
+    // throws as before, for debugging the missing setup.
+    if (queue.shader.find(0x20c) == queue.shader.end()) {
+        static const bool strict = std::getenv("APS5_STRICT_DISPATCH") != nullptr;
+        if (strict) require(false, "compute dispatch without a programmed program (shader 0x20c missing)");
+        static std::atomic<std::uint64_t> skips{0};
+        static std::atomic<std::uint64_t> reported{0};
+        const auto total = skips.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (reported.load(std::memory_order_relaxed) < 4) {
+            reported.fetch_add(1, std::memory_order_relaxed);
+            std::string regs;
+            for (const auto& [offset, value] : queue.shader) {
+                char entry[24];
+                std::snprintf(entry, sizeof(entry), " %x=%08x", offset, value);
+                regs += entry;
+                if (regs.size() > 200) break;
+            }
+            char words[160] = "";
+            for (std::size_t i = 0; i < packet.size() && i < 8; ++i) {
+                char entry[16];
+                std::snprintf(entry, sizeof(entry), " %08x", packet[i]);
+                std::strncat(words, entry, sizeof(words) - std::strlen(words) - 1);
+            }
+            std::fprintf(stderr, "[gpu] skipped compute dispatch without program regs (%llu total, %zu tracked:%s; packet:%s)\n", static_cast<unsigned long long>(total), queue.shader.size(), regs.c_str(), words);
+        }
+        pendingDispatchPhases().outcome = DispatchOutcome::Skipped;
+        return;
+    }
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     auto it = submission.shaders->upper_bound(address);
     std::shared_ptr<const ShaderSnapshot> registeredShader;
@@ -20,7 +57,29 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         --it;
         if (address - it->second->codeAddress < it->second->code.size() * sizeof(std::uint32_t)) registeredShader = it->second;
     }
-    if (!registeredShader) registeredShader = ReadRawComputeShader(address);
+    if (!registeredShader) {
+        // Playable rule: while streaming, the programmed program address can
+        // still be garbage (unmapped/unqueryable code, misaligned pointer, or
+        // no reachable end within mapped pages). There is nothing to run, so
+        // skip like the capture failures below. Anything else still throws.
+        try {
+            registeredShader = ReadRawComputeShader(address);
+        } catch (const std::exception& error) {
+            const std::string reason = error.what();
+            if (reason.find("cannot query guest memory") == std::string::npos &&
+                reason.find("null or misaligned address") == std::string::npos &&
+                reason.find("no reachable end") == std::string::npos) throw;
+            static std::atomic<std::uint64_t> rawSkips{0};
+            static std::atomic<std::uint64_t> rawReported{0};
+            const auto total = rawSkips.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (rawReported.load(std::memory_order_relaxed) < 8) {
+                rawReported.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr, "[gpu] skipped compute dispatch: unreadable program (%llu total): compute shader 0x%llx: %s\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(address), reason.c_str());
+            }
+            pendingDispatchPhases().outcome = DispatchOutcome::Skipped;
+            return;
+        }
+    }
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
@@ -198,10 +257,25 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             forgetAtCapture = GuestMemory::ForgetSerial();
-            capture = [&] {
-                const SampledReadScope sampling(evidenceReads);
-                return shaderMemory->Capture(invocation);
-            }();
+            // Playable rule, same as the draw capture: guest descriptors
+            // streamed in during loads may decode to garbage; skip this
+            // dispatch (counted "skipped" outcome) instead of terminating.
+            try {
+                capture = [&] {
+                    const SampledReadScope sampling(evidenceReads);
+                    return shaderMemory->Capture(invocation);
+                }();
+            } catch (const std::exception& error) {
+                static std::atomic<std::uint64_t> captureSkips{0};
+                static std::atomic<std::uint64_t> captureReported{0};
+                const auto total = captureSkips.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (captureReported.load(std::memory_order_relaxed) < 4) {
+                    captureReported.fetch_add(1, std::memory_order_relaxed);
+                    std::fprintf(stderr, "[gpu] skipped compute dispatch: recompile capture failed (%llu total): %s\n", static_cast<unsigned long long>(total), error.what());
+                }
+                pendingDispatchPhases().outcome = DispatchOutcome::Skipped;
+                return;
+            }
             captured = shaderMemory->Regions();
             request.context.memory = captured;
             if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, captured, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
@@ -227,7 +301,23 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             char where[96];
             if (dump.empty()) std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
             else std::snprintf(where, sizeof(where), "compute shader 0x%llx (%s): ", static_cast<unsigned long long>(address), dump.c_str());
-            throw std::runtime_error(where + reason);
+            // Playable rule: program lookup, capture and materialization all
+            // read guest state that may still be streaming; skip this
+            // dispatch (counted "skipped" outcome) instead of terminating.
+            // Persistent offenders stay visible through the first-8 reports
+            // and the outcome counters. Strict mode (APS5_STRICT_DISPATCH=1)
+            // throws as before.
+            static const bool strictDispatch = std::getenv("APS5_STRICT_DISPATCH") != nullptr;
+            if (strictDispatch) throw std::runtime_error(where + reason);
+            static std::atomic<std::uint64_t> materializeSkips{0};
+            static std::atomic<std::uint64_t> materializeReported{0};
+            const auto total = materializeSkips.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (materializeReported.load(std::memory_order_relaxed) < 8) {
+                materializeReported.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr, "[gpu] skipped compute dispatch: shader materialization failed (%llu total): %s%s\n", static_cast<unsigned long long>(total), where, reason.c_str());
+            }
+            pendingDispatchPhases().outcome = DispatchOutcome::Skipped;
+            return;
         }
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
@@ -270,6 +360,32 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
         throw std::runtime_error(where + std::string(error.what()));
     };
+    // Playable rule: a captured range with a garbage address (partially
+    // streamed descriptors, e.g. 0xe00000005204+0x22aa22aa at the cutscene)
+    // makes DescribeCommitted unqueryable, and garbage sampler/image words
+    // fail descriptor building. The data was never readable, so there is
+    // nothing to run: skip like the capture/materialization failures above
+    // instead of terminating. Anything else still throws.
+    const auto skipUnqueryable = [&](const std::exception& error) -> bool {
+        if (dynamic_cast<const std::bad_alloc*>(&error) != nullptr) return false;
+        const std::string reason = error.what();
+        for (const char* marker : {"cannot query guest memory", "null or misaligned address",
+                                   "runtime image descriptor is invalid",
+                                   "DescriptorBindingBuilder::Populate"}) {
+            if (reason.find(marker) != std::string::npos) {
+                static std::atomic<std::uint64_t> querySkips{0};
+                static std::atomic<std::uint64_t> queryReported{0};
+                const auto total = querySkips.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (queryReported.load(std::memory_order_relaxed) < 8) {
+                    queryReported.fetch_add(1, std::memory_order_relaxed);
+                    std::fprintf(stderr, "[gpu] skipped compute dispatch: bad guest resources (%llu total): compute shader 0x%llx: %s\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(address), reason.c_str());
+                }
+                pendingDispatchPhases().outcome = DispatchOutcome::Skipped;
+                return true;
+            }
+        }
+        return false;
+    };
     phaseTiming.Phase(PhaseSnapshots);
 
     std::shared_ptr<RecipeHit> recipeHit;
@@ -290,6 +406,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             try {
                 prepared = localDevice->PrepareDispatch(compiled, snapshots);
             } catch (const std::exception& error) {
+                if (skipUnqueryable(error)) return;
                 rethrow(error);
             }
             if (profile) {
@@ -338,6 +455,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
             }
         } catch (const std::exception& error) {
+            if (skipUnqueryable(error)) return;
             rethrow(error);
         }
         if (builtRecipe != nullptr) {

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
+#include <atomic>
 #include <thread>
 #include <chrono>
 #include <cstdio>
@@ -745,8 +746,30 @@ void ExecuteIndirectRegisters(std::span<const std::uint32_t> packet, std::span<c
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     require(packet.size() == 5 && IndirectRegisterOpcode(opcode), "expected indirect register packet");
     require(pairs.size() == static_cast<std::size_t>(packet[4]) * 2, "indirect register list does not match its packet");
-    for (std::size_t i = 0; i < pairs.size(); i += 2) registerOffset(pairs[i]);
-    for (std::size_t i = 0; i < pairs.size(); i += 2) writeRegister(queue, opcode, registerOffset(pairs[i]), pairs[i + 1]);
+    // Playable rule: indirect lists live in guest memory (streamed in during
+    // loads), and cutscene phases emit offsets outside the modeled range
+    // (0x47000000). Skip such pairs (bounded forensics) instead of
+    // terminating: later lists re-deliver the registers once streamed, and a
+    // missing program register already degrades to a skipped dispatch rather
+    // than death. The 0xffffffff sentinel keeps its existing behavior.
+    const auto modeled = [](std::uint32_t offset) { return offset == 0xffffffffu || (offset & ~0x70000000u) <= 0xffffu; };
+    for (std::size_t i = 0; i < pairs.size(); i += 2) {
+        if (!modeled(pairs[i])) {
+            static std::atomic<std::uint64_t> skips{0};
+            static std::atomic<std::uint64_t> reported{0};
+            const auto total = skips.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (reported.load(std::memory_order_relaxed) < 4) {
+                reported.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr, "[gpu] skipped indirect register pair %zu/%zu with out-of-range offset 0x%08x=value 0x%08x (opcode 0x%x, %llu total)\n", i / 2, pairs.size() / 2, pairs[i], pairs[i + 1], opcode, static_cast<unsigned long long>(total));
+            }
+            continue;
+        }
+        registerOffset(pairs[i]);
+    }
+    for (std::size_t i = 0; i < pairs.size(); i += 2) {
+        if (!modeled(pairs[i])) continue;
+        writeRegister(queue, opcode, registerOffset(pairs[i]), pairs[i + 1]);
+    }
     if (queue.savedContext.has_value() && TraceContextState()) {
         std::fprintf(stderr, "[context]   indirect 0x%x:", opcode);
         for (std::size_t i = 0; i < pairs.size(); i += 2) std::fprintf(stderr, " %x", registerOffset(pairs[i]));

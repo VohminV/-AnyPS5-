@@ -1,5 +1,6 @@
 #include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
+#include "prx/libc/include/CrashNotes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/File/include/File.hpp"
@@ -113,6 +114,7 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
         if (std::filesystem::is_directory(native, error)) fd = File::OpenDirectoryDescriptor(native);
     }
 #endif
+    CrashNotef_nid_no_patch("open", "%s -> %d", path != nullptr ? path : "?", fd);
     if (fd < 0) {
         return SceErrorFromErrno(errno);
     }

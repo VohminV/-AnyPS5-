@@ -29,9 +29,12 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
+#include <span>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -889,67 +892,94 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             Require(draw.firstInstance <= std::numeric_limits<std::uint32_t>::max() - (draw.instanceCount - 1u), "auto draw instance range overflow");
         }
     }
-    if (args == nullptr) Require(draw.indexCount != 0 && draw.instanceCount != 0, "zero-count indexed draws are unsupported");
-    else Require((!state.stages.mesh || draw.indexed) && !state.stages.tessellation && !state.rectList, "indirect draw on a non-vertex path must be resolved by the driver");
+    // inputs.indexBytes/indexBytes/attributes stay at function scope (after
+    // the early-nothing return and modifier checks above, as before): the
+    // fetch plan below the guard uses them for every draw, skipped or not.
+    // An empty stage list (or a null program, both test-harness-only: real
+    // draws always carry compiled programs) has no descriptors: the
+    // validations below keep throwing their exact messages instead of
+    // faulting on the dereference.
     inputs.indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
     const auto indexBytes = inputs.indexBytes;
-    APS5_LOG_OUT_DEBUG("Index buffer bytes=%llu", static_cast<unsigned long long>(indexBytes));
-    Require(indexBytes <= std::numeric_limits<std::size_t>::max(), "index buffer size overflow");
-    if (draw.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
-    APS5_LOG_CHARS_OUT_DEBUG("Index buffer range OK");
-    Require(!draw.indexed || !state.hasColorTarget || draw.indexAddress + indexBytes <= state.color.address || state.color.address + state.color.bytes <= draw.indexAddress, "index buffer aliases the render target");
+    static const std::vector<ShaderRecompiler::VertexAttribute> noAttributes{};
+    const auto& attributes = shaders.empty() || shaders.front().program == nullptr ? noAttributes : shaders.front().program->vertexAttributes;
     if (state.rectList) Require(draw.indexCount % 3 == 0, "incomplete rect-list primitive");
-    APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders");
-    if (recipe != nullptr) {
-        inputs.fragmentOutputs = recipe->fragmentOutputs;
-        inputs.shaderStages = recipe->shaderStages;
-    } else {
-        inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
-        inputs.shaderStages = PipelineStages(shaders);
-    }
-    APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders OK");
-    APS5_LOG_OUT_DEBUG("PipelineStages=0x%x", static_cast<unsigned>(inputs.shaderStages));
-    if (state.stages.mesh) {
-        APS5_LOG_CHARS_OUT_DEBUG("Mesh path");
-        Require(context.meshShader, "device does not support mesh shaders");
-        const auto& mesh = *state.stages.mesh;
-        const auto inputSize = mesh.inputPrimitive == 1 ? 1u : mesh.inputPrimitive == 2 ? 2u : 3u;
-        Require(draw.indexCount >= inputSize && mesh.primitivesPerGroup != 0, "mesh draw contains no complete primitive");
-        if (args == nullptr) {
-            const auto step = mesh.inputPrimitive == 5 || mesh.inputPrimitive == 6 ? 1u : inputSize;
-            const auto primitives = (draw.indexCount - inputSize) / step + 1u;
-            inputs.meshGroups = (primitives - 1u) / mesh.primitivesPerGroup + 1u;
-            APS5_LOG_OUT_DEBUG("Mesh primitives=%u groups=%u", primitives, inputs.meshGroups);
-            Require(inputs.meshGroups <= context.meshLimits.maxMeshWorkGroupCount[0] && draw.instanceCount <= context.meshLimits.maxMeshWorkGroupCount[1] && static_cast<std::uint64_t>(inputs.meshGroups) * draw.instanceCount <= context.meshLimits.maxMeshWorkGroupTotalCount, "mesh draw exceeds workgroup count limits");
+    // Draw-input Hacker rule: every validation of guest-driven draw inputs
+    // (counts, index range, shader/state validation, vertex layout) degrades
+    // to skipping this draw. Partially streamed descriptors must never kill
+    // the process; persistent offenders stay visible through the first-8
+    // reports and the Nothing skip counters.
+    try {
+        if (args == nullptr) Require(draw.indexCount != 0 && draw.instanceCount != 0, "zero-count indexed draws are unsupported");
+        else Require((!state.stages.mesh || draw.indexed) && !state.stages.tessellation && !state.rectList, "indirect draw on a non-vertex path must be resolved by the driver");
+        APS5_LOG_OUT_DEBUG("Index buffer bytes=%llu", static_cast<unsigned long long>(indexBytes));
+        Require(indexBytes <= std::numeric_limits<std::size_t>::max(), "index buffer size overflow");
+        if (draw.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+        APS5_LOG_CHARS_OUT_DEBUG("Index buffer range OK");
+        Require(!draw.indexed || !state.hasColorTarget || draw.indexAddress + indexBytes <= state.color.address || state.color.address + state.color.bytes <= draw.indexAddress, "index buffer aliases the render target");
+        APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders");
+        if (recipe != nullptr) {
+            inputs.fragmentOutputs = recipe->fragmentOutputs;
+            inputs.shaderStages = recipe->shaderStages;
+        } else {
+            inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
+            inputs.shaderStages = PipelineStages(shaders);
         }
-    }
-    if (state.stages.tessellation) Require(draw.indexCount % state.stages.tessellation->inputControlPoints == 0, "incomplete tessellation patch");
-    // Viewport and scissor are dynamic pipeline state, so their limits are checked here per draw.
-    ValidateViewport(context, state.viewport);
-    ValidateDepthBounds(context, state);
-    timer.phase(PhaseValidate);
-    inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
-    if (draw.indexed) {
-        const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-        const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
-        const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
-        const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
-        auto copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
-        std::uint32_t highest = copy.derived;
-        if (!copy.reused) {
-            highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
-            KeepDrawInput(context.recorder, draw.indexAddress, copy, use, highest);
+        APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders OK");
+        APS5_LOG_OUT_DEBUG("PipelineStages=0x%x", static_cast<unsigned>(inputs.shaderStages));
+        if (state.stages.mesh) {
+            APS5_LOG_CHARS_OUT_DEBUG("Mesh path");
+            Require(context.meshShader, "device does not support mesh shaders");
+            const auto& mesh = *state.stages.mesh;
+            const auto inputSize = mesh.inputPrimitive == 1 ? 1u : mesh.inputPrimitive == 2 ? 2u : 3u;
+            Require(draw.indexCount >= inputSize && mesh.primitivesPerGroup != 0, "mesh draw contains no complete primitive");
+            if (args == nullptr) {
+                const auto step = mesh.inputPrimitive == 5 || mesh.inputPrimitive == 6 ? 1u : inputSize;
+                const auto primitives = (draw.indexCount - inputSize) / step + 1u;
+                inputs.meshGroups = (primitives - 1u) / mesh.primitivesPerGroup + 1u;
+                APS5_LOG_OUT_DEBUG("Mesh primitives=%u groups=%u", primitives, inputs.meshGroups);
+                Require(inputs.meshGroups <= context.meshLimits.maxMeshWorkGroupCount[0] && draw.instanceCount <= context.meshLimits.maxMeshWorkGroupCount[1] && static_cast<std::uint64_t>(inputs.meshGroups) * draw.instanceCount <= context.meshLimits.maxMeshWorkGroupTotalCount, "mesh draw exceeds workgroup count limits");
+            }
         }
-        Require(highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
-        Require(!fanGeometry || !state.primitiveRestart || highest != (draw.indexSize == 2 ? 0xffffu : 0xffffffffu), "primitive restart in a triangle fan geometry draw is unsupported");
-        inputs.maxIndex = highest;
-        inputs.indices = std::move(copy.buffer);
+        if (state.stages.tessellation) Require(draw.indexCount % state.stages.tessellation->inputControlPoints == 0, "incomplete tessellation patch");
+        // Viewport and scissor are dynamic pipeline state, so their limits are checked here per draw.
+        ValidateViewport(context, state.viewport);
+        ValidateDepthBounds(context, state);
+        timer.phase(PhaseValidate);
+        inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
+        if (draw.indexed) {
+            const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
+            const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
+            const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
+            auto copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+            std::uint32_t highest = copy.derived;
+            if (!copy.reused) {
+                highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
+                KeepDrawInput(context.recorder, draw.indexAddress, copy, use, highest);
+            }
+            Require(highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
+            Require(!fanGeometry || !state.primitiveRestart || highest != (draw.indexSize == 2 ? 0xffffu : 0xffffffffu), "primitive restart in a triangle fan geometry draw is unsupported");
+            inputs.maxIndex = highest;
+            inputs.indices = std::move(copy.buffer);
+        }
+        APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
+        // Validates the vertex descriptors; the layout also keys and builds the pipeline.
+        // Same Hacker rule as the per-fetch guard below: a partially streamed
+        // (garbage-format) descriptor must skip this draw, not kill the process.
+        // BuildVertexInputLayout decodes every attribute up front, so this also
+        // covers indirect draws (whose Extent path never decodes the format).
+        if (recipe != nullptr) inputs.vertexInput = recipe->vertexInput;
+        else inputs.vertexInput = BuildVertexInputLayout(context, attributes);
+    } catch (const std::exception& error) {
+        static std::atomic<int> inputReports{0};
+        if (inputReports.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::fprintf(stderr, "[gpu] draw input skip: %s\n", error.what());
+        }
+        inputs.nothing = true;
+        timer.phase(PhaseVertex);
+        return inputs;
     }
-    APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
-    const auto& attributes = shaders.front().program->vertexAttributes;
-    // Validates the vertex descriptors; the layout also keys and builds the pipeline.
-    if (recipe != nullptr) inputs.vertexInput = recipe->vertexInput;
-    else inputs.vertexInput = BuildVertexInputLayout(context, attributes);
     inputs.vertexOffsets.assign(attributes.size(), 0);
     // An indexed draw's vertex offset moves every fetch: the copy must reach the last one.
     if (draw.indexed) {
@@ -963,8 +993,40 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         const auto& attribute = attributes[i];
         if (NullVertexDescriptor(attribute)) continue;
-        // An indirect draw's counts are unknown here: the descriptor's whole range is copied.
-        const auto bytes = args != nullptr ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, inputs.maxIndex, draw.instanceCount, draw.firstInstance);
+        // Hacker rule: a bad guest draw never kills the process. Out-of-range
+        // vertex fetch (corrupt index, restart misclassified, clobbered
+        // descriptor) skips this draw; the packet layer counts it as Nothing.
+        // Heavy forensics (guest read + file dump) only with APS5_DUMP_VERTEXFAIL=1.
+        std::size_t bytes = 0;
+        try {
+            bytes = args != nullptr ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, inputs.maxIndex, draw.instanceCount, draw.firstInstance);
+        } catch (const std::exception& error) {
+            static std::atomic<int> reports{0};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::fprintf(stderr, "[gpu] vertex fetch skip: topology %d primRestart %d listRestart %d indexed %d maxIndex %u indexSize %u instances %u: %s\n", static_cast<int>(state.topology), state.primitiveRestart ? 1 : 0, context.primitiveListRestart ? 1 : 0, draw.indexed ? 1 : 0, inputs.maxIndex, draw.indexSize, draw.instanceCount, error.what());
+            }
+            static const bool dump = std::getenv("APS5_DUMP_VERTEXFAIL") != nullptr;
+            if (dump && draw.indexed && indexBytes != 0 && (draw.indexSize == 2 || draw.indexSize == 4)) {
+                const std::size_t dumpBytes = static_cast<std::size_t>(std::min<std::uint64_t>(indexBytes, 1u << 20));
+                std::vector<std::byte> dumpData(dumpBytes);
+                GuestMemory::ReadCommitted(draw.indexAddress, std::span(dumpData));
+                std::uint64_t restarts = 0, maxOther = 0;
+                for (std::size_t at = 0; at + draw.indexSize <= dumpBytes; at += draw.indexSize) {
+                    std::uint32_t value = 0;
+                    std::memcpy(&value, dumpData.data() + at, draw.indexSize);
+                    if (value == (draw.indexSize == 2 ? 0xffffu : 0xffffffffu)) ++restarts;
+                    else maxOther = std::max<std::uint64_t>(maxOther, value);
+                }
+                std::fprintf(stderr, "[gpu] vertex fetch forensics: index buffer 0x%llx+%llu holds %llu restart values, max other index %llu (%zu bytes dumped to vertexfetch-fail.bin)\n", static_cast<unsigned long long>(draw.indexAddress), static_cast<unsigned long long>(indexBytes), static_cast<unsigned long long>(restarts), static_cast<unsigned long long>(maxOther), dumpBytes);
+                if (FILE* file = std::fopen("vertexfetch-fail.bin", "wb")) {
+                    std::fwrite(dumpData.data(), 1, dumpBytes, file);
+                    std::fclose(file);
+                }
+            }
+            inputs.nothing = true;
+            timer.phase(PhaseVertex);
+            return inputs;
+        }
         const auto& fields = attribute.resource.fields;
         const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
         Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address, "vertex buffer aliases the render target");
@@ -1033,11 +1095,52 @@ struct ResolvedResources {
     ResourceCache::Key contentKey;
     bool cacheable = false;
     const ShaderResources::BuildTiming* built = nullptr;
+    // Set when the draw was skipped before building (transient buffer/target
+    // aliasing, see below): the caller returns without recording anything.
+    bool skipped = false;
 };
 
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
+    // Playable rule: the build rejects shader buffers aliasing the render
+    // target (or writable ones aliasing the index range). While streaming,
+    // descriptors transiently overlap after target reuse; skipping the draw
+    // (counted) beats terminating. The pre-check mirrors the build's own
+    // conditions exactly, so device errors inside the build stay fatal.
+    try {
+        CheckBufferAliases(shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes));
+    } catch (const std::exception& error) {
+        static std::atomic<int> aliasReports{0};
+        if (aliasReports.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::fprintf(stderr, "[gpu] draw resource skip: %s\n", error.what());
+        }
+        resolved.skipped = true;
+        return resolved;
+    }
+    // Late resource failures (cache-hit re-check below, fresh build below) mean
+    // the same transient/streaming garbage the pre-check guards: skip the
+    // draw the same way. Anything else still throws.
+    const auto skipLateAlias = [&](const std::exception& error) -> bool {
+        if (dynamic_cast<const std::bad_alloc*>(&error) != nullptr) return false;
+        const std::string reason = error.what();
+        for (const char* marker : {"aliases the render target", "aliases the index buffer",
+                                   "cannot query guest memory", "null or misaligned address",
+                                   "runtime image descriptor is invalid",
+                                   "DescriptorBindingBuilder::Populate"}) {
+            if (reason.find(marker) != std::string::npos) {
+                static std::atomic<int> lateReports{0};
+                if (lateReports.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    std::fprintf(stderr, "[gpu] draw resource skip: %s\n", reason.c_str());
+                }
+                resolved.resources = nullptr;
+                resolved.moved.clear();
+                resolved.skipped = true;
+                return true;
+            }
+        }
+        return false;
+    };
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
     // descriptor set when it is still valid (see ResourceCache; the dispatch path does the same).
     // Only recordable draws take part: a synchronous draw writes its resources back, which a shared
@@ -1058,7 +1161,14 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
             if (moved.has_value()) {
-                if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                if (trimKey) {
+                    try {
+                        CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                    } catch (const std::exception& error) {
+                        if (!skipLateAlias(error)) throw;
+                        return resolved;
+                    }
+                }
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
@@ -1075,7 +1185,12 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
-        resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        try {
+            resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        } catch (const std::exception& error) {
+            if (!skipLateAlias(error)) throw;
+            return resolved;
+        }
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
@@ -1700,6 +1815,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     auto* recorder = Recorder::Active();
     const bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr; });
     auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    // Aliasing pre-check above declined this draw (transient buffer/target
+    // overlap while streaming): same silent return as an empty draw.
+    if (resolved.skipped) return;
     auto& resources = resolved.resources;
     const auto& contentKey = resolved.contentKey;
     const bool cacheable = resolved.cacheable;
@@ -2186,7 +2304,31 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseLookup);
         return miss(DrawRecipeMiss::Proof);
     }
-    CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
+    // Same transient-resource rule as resolveDrawResources: a recipe hit whose
+    // descriptors fail against this draw's state is a miss (the caller
+    // rebuilds, which skips), not a fatal error.
+    try {
+        CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
+    } catch (const std::exception& error) {
+        if (dynamic_cast<const std::bad_alloc*>(&error) == nullptr) {
+            const std::string reason = error.what();
+            for (const char* marker : {"aliases the render target", "aliases the index buffer",
+                                       "cannot query guest memory", "null or misaligned address",
+                                       "runtime image descriptor is invalid",
+                                       "DescriptorBindingBuilder::Populate"}) {
+                if (reason.find(marker) != std::string::npos) {
+                    static std::atomic<int> recipeAliasReports{0};
+                    if (recipeAliasReports.fetch_add(1, std::memory_order_relaxed) < 8) {
+                        std::fprintf(stderr, "[gpu] draw resource skip: %s\n", reason.c_str());
+                    }
+                    recorder->Keep(std::move(resources));
+                    timer.phase(PhaseLookup);
+                    return miss(DrawRecipeMiss::Proof);
+                }
+            }
+        }
+        throw;
+    }
     SharedResourceCache().Touch(recipe.key);
     countCache(&DrawProfile::cacheHits);
     timer.phase(PhaseLookup);

@@ -11,6 +11,8 @@
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/CpuBackend/include/CpuBackend/Backend.hpp"
 #include <unordered_map>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
@@ -357,7 +359,22 @@ void Driver::execute(const Submission& submission) {
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {
                         countSkip(Graphics::DrawSkip::Prechecked);
-                        throw std::runtime_error(rejected);
+                        // Playable rule: a rejected draw skips its packet and
+                        // the submission continues (a partially streamed
+                        // descriptor set rejects until streamed, then draws).
+                        // Persistent offenders stay visible through the
+                        // first-8 reports, the Prechecked counters and the
+                        // per-draw CaptureTrace line above. Strict mode
+                        // (APS5_STRICT_DRAWS=1) throws as before.
+                        static const bool strictDraws = std::getenv("APS5_STRICT_DRAWS") != nullptr;
+                        if (strictDraws) throw std::runtime_error(rejected);
+                        static std::atomic<std::uint64_t> rejectionSkips{0};
+                        static std::atomic<std::uint64_t> rejectionReported{0};
+                        const auto skipped = rejectionSkips.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (rejectionReported.load(std::memory_order_relaxed) < 8) {
+                            rejectionReported.fetch_add(1, std::memory_order_relaxed);
+                            std::fprintf(stderr, "[gpu] skipped rejected draw (%llu total): %.200s\n", static_cast<unsigned long long>(skipped), rejected.c_str());
+                        }
                     } else if (verdict == DrawVerdict::Nothing) {
                         countSkip(Graphics::DrawSkip::Nothing);
                     } else if (traceDraws) {

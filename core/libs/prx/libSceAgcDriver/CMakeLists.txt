@@ -126,6 +126,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestUnifiedMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -280,6 +281,23 @@ if(BUILD_TESTING)
     set_tests_properties(agc_write_tracking PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_write_tracking PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_uma_tests EXCLUDE_FROM_ALL
+        tests/GuestUnifiedMemory.cpp
+        Execution/src/GuestUnifiedMemory.cpp
+)
+target_include_directories(agc_uma_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_uma_tests PRIVATE libc)
+set_target_properties(agc_uma_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_uma_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_uma_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_uma COMMAND agc_uma_tests)
+    if(WIN32)
+        set_tests_properties(agc_uma PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -526,6 +544,9 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/GuestTextureResource.cpp
         tests/GuestSamplerResource.cpp
         tests/TextureDetiler.cpp
+        tests/DepthSurfaceReuse.cpp
+        tests/UntrackedRescue.cpp
+        tests/ResidentReuse.cpp
         Graphics/src/Draw.cpp
         Graphics/src/DepthSurface.cpp
         Graphics/src/Pipeline.cpp

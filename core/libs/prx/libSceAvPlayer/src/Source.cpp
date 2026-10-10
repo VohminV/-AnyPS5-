@@ -7,9 +7,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <thread>
 #include <vector>
 
 extern "C" {
@@ -205,6 +207,9 @@ struct Decoder {
     std::vector<std::uint8_t*> allocated;
     std::optional<Frame> current;
     std::deque<std::uint8_t*> handedOut;
+    // Buffers Unity may still reference after Stop(): retired here instead of
+    // freed, released at the next Start or at destruction (see below).
+    std::vector<std::uint8_t*> retired;
     std::size_t retained = 0;
     std::uint32_t bufferSize = 0;
     std::uint64_t epoch = 0;
@@ -222,6 +227,11 @@ public:
 
     ~FfmpegSource() override {
         Stop();
+        waitForQuiescence();
+        {
+            std::lock_guard lock(mutex);
+            freeRetiredLocked();
+        }
         avformat_close_input(&format);
         replacement.reset();
     }
@@ -342,6 +352,8 @@ public:
             audioDriving = false;
             presented = false;
             lastPresented = 0;
+            // Unity asked for new playback, so it is done with pre-Stop frames.
+            freeRetiredLocked();
             presentationClock.Reset(static_cast<double>(start));
             for (auto* decoder : {&video, &audio}) {
                 decoder->switchTo = -1;
@@ -370,13 +382,36 @@ public:
         for (auto* decoder : {&video, &audio}) {
             if (decoder->thread.joinable()) decoder->thread.join();
         }
-        releaseDecoders();
-        for (auto* decoder : {&video, &audio}) {
-            if (decoder->switchTo >= 0) decoder->stream = decoder->switchTo;
-            decoder->switchTo = -1;
+        // Unity never returns video buffers (no release API is wired up; the
+        // engine recycles by age). Freeing handed-out buffers here pulls memory
+        // from under Unity's in-flight upload (e.g. pressing Skip, which stops
+        // the player while the gfx worker still references the last frame) and
+        // crashes the title. Retire them instead: they stay valid until the
+        // next Start or destruction. APS5_AV_EAGER_STOP_FREE=1 keeps the old
+        // freeing behaviour.
+        static const bool eagerFree = std::getenv("APS5_AV_EAGER_STOP_FREE") != nullptr;
+        std::size_t retiredCount = 0;
+        {
+            std::lock_guard lock(mutex);
+            if (!eagerFree) {
+                for (auto* decoder : {&video, &audio}) {
+                    if (decoder->current) {
+                        decoder->retired.push_back(decoder->current->buffer);
+                        ++retiredCount;
+                    }
+                    retiredCount += decoder->handedOut.size();
+                    decoder->retired.insert(decoder->retired.end(), decoder->handedOut.begin(), decoder->handedOut.end());
+                }
+            }
+            releaseDecoders();
+            for (auto* decoder : {&video, &audio}) {
+                if (decoder->switchTo >= 0) decoder->stream = decoder->switchTo;
+                decoder->switchTo = -1;
+            }
+            started = false;
+            paused = false;
         }
-        started = false;
-        paused = false;
+        if (retiredCount != 0) APS5_LOG_OUT("[avplayer] Stop: retired %zu handed-out buffers (freed at next Start/Close)", retiredCount);
     }
 
     void Pause() override {
@@ -517,6 +552,7 @@ private:
         present(video, info);
         presented = true;
         lastPresented = info.timestamp;
+        lastTakeMs.store(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), std::memory_order_relaxed);
         return true;
     }
 
@@ -530,6 +566,7 @@ private:
         audioDriving = true;
         clockEpoch = std::max(clockEpoch, epoch);
         presentationClock.Rebase(static_cast<double>(info.timestamp));
+        lastTakeMs.store(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), std::memory_order_relaxed);
         return true;
     }
 
@@ -659,13 +696,16 @@ private:
             decoder->handedOut.clear();
             decoder->free.clear();
             for (auto* buffer : decoder->allocated) {
+                // Retired buffers stay alive for Unity's in-flight use; freed
+                // at the next Start or at destruction (see Stop()).
+                if (std::find(decoder->retired.begin(), decoder->retired.end(), buffer) != decoder->retired.end()) continue;
                 if (decoder->video) {
                     memory.deallocate_texture(memory.object_ptr, buffer);
                 } else {
                     memory.deallocate(memory.object_ptr, buffer);
                 }
             }
-            decoder->allocated.clear();
+            decoder->allocated = decoder->retired;
             avcodec_free_context(&decoder->context);
         }
         sws_freeContext(scaler);
@@ -674,6 +714,36 @@ private:
         av_channel_layout_uninit(&resamplerLayout);
         resamplerFormat = -1;
         resamplerRate = 0;
+    }
+
+    // Frees retired buffers; caller must hold mutex. Retired buffers are also
+    // present in allocated (see releaseDecoders), so drop them there too:
+    // otherwise the next releaseDecoders would free the same pointer again.
+    void freeRetiredLocked() {
+        const auto& memory = settings.memory;
+        for (auto* decoder : {&video, &audio}) {
+            for (auto* buffer : decoder->retired) {
+                if (decoder->video) memory.deallocate_texture(memory.object_ptr, buffer);
+                else memory.deallocate(memory.object_ptr, buffer);
+                std::erase(decoder->allocated, buffer);
+            }
+            decoder->retired.clear();
+        }
+    }
+
+    // Bounds the Close-time wait for Unity's in-flight frame use: returns once
+    // no frame was taken for 300 ms, at most ~2 s. Close is teardown, so a
+    // short bounded wait beats freeing memory Unity may still upload.
+    void waitForQuiescence() {
+        const auto last = lastTakeMs.load(std::memory_order_relaxed);
+        if (last == 0) return;
+        const auto lastTp = std::chrono::steady_clock::time_point(std::chrono::milliseconds(last));
+        const auto start = std::chrono::steady_clock::now();
+        for (;;) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastTp >= std::chrono::milliseconds(300) || now - start >= std::chrono::seconds(2)) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
     }
 
     void seek(std::uint64_t milliseconds) {
@@ -698,6 +768,16 @@ private:
     void returnBuffer(Decoder& decoder, std::uint8_t* buffer) {
         {
             std::lock_guard lock(mutex);
+            if (auto it = std::find(decoder.retired.begin(), decoder.retired.end(), buffer); it != decoder.retired.end()) {
+                // Late return for a buffer retired at Stop(): free it now.
+                decoder.retired.erase(it);
+                std::erase(decoder.allocated, buffer);
+                const auto& memory = settings.memory;
+                if (decoder.video) memory.deallocate_texture(memory.object_ptr, buffer);
+                else memory.deallocate(memory.object_ptr, buffer);
+                condition.notify_all();
+                return;
+            }
             decoder.free.push_back(buffer);
         }
         condition.notify_all();
@@ -1070,6 +1150,9 @@ private:
     bool audioDriving = false;
     bool presented = false;
     std::uint64_t lastPresented = 0;
+    // Last takeVideo/takeAudio success (steady-clock ms); bounds the Close-time
+    // quiescence wait so retired buffers are not freed mid-upload.
+    std::atomic<std::uint64_t> lastTakeMs{0};
     Clock presentationClock;
 
     std::uint32_t pitch = 0;

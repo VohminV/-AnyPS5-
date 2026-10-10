@@ -31,6 +31,9 @@
 #include <stop_token>
 #include <cstdlib>
 #include <cstdio>
+#include <string>
+#include <utility>
+#include <vector>
 #include <chrono>
 #include <algorithm>
 #include <cstring>
@@ -2570,10 +2573,45 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     if (writeTableRanges != nullptr) return CachedTable{writeTableSerial, writeTableRanges.get()};
     std::lock_guard lock(space->tableMutex);
     const auto found = space->writeTables.find(writes);
+    // Diagnostic: APS5_VERIFY_BDA_TABLE=1 recomputes the address table on
+    // every hit and aborts on any difference (a hit serving device addresses
+    // from imports that were since dropped/recreated for the same guest
+    // ranges writes through stale pointers). Off by default.
+    static const bool verifyTable = std::getenv("APS5_VERIFY_BDA_TABLE") != nullptr;
+    static std::atomic<std::uint64_t> tableHits{0}, tableMisses{0};
     if (found != space->writeTables.end()) {
+        if (verifyTable) {
+            const auto fresh = AddressRanges();
+            const auto& cached = *found->second.second;
+            bool same = fresh.size() == cached.size();
+            for (std::size_t i = 0; same && i < fresh.size(); ++i) {
+                const auto& a = fresh[i];
+                const auto& b = cached[i];
+                same = a.begin == b.begin && a.end == b.end && a.deviceAddress == b.deviceAddress && a.permissions == b.permissions;
+            }
+            if ((tableHits.fetch_add(1, std::memory_order_relaxed) + 1) % 4096 == 0) std::fprintf(stderr, "[bda-table] %llu hits, %llu misses\n", static_cast<unsigned long long>(tableHits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(tableMisses.load(std::memory_order_relaxed)));
+            if (!same) {
+                std::fprintf(stderr, "[bda-table] APS5_VERIFY_BDA_TABLE: cached table disagrees with fresh lookup (%zu vs %zu ranges); first difference:\n", cached.size(), fresh.size());
+                for (std::size_t i = 0; i < std::max(fresh.size(), cached.size()); ++i) {
+                    const auto show = [](const std::vector<ShaderRecompiler::BdaAbi::Range>& table, std::size_t k) {
+                        if (k >= table.size()) return std::string("(none)");
+                        char line[160];
+                        std::snprintf(line, sizeof(line), "[0x%llx, 0x%llx) -> 0x%llx perm %u", static_cast<unsigned long long>(table[k].begin), static_cast<unsigned long long>(table[k].end), static_cast<unsigned long long>(table[k].deviceAddress), table[k].permissions);
+                        return std::string(line);
+                    };
+                    if (i >= fresh.size() || i >= cached.size() || fresh[i].begin != cached[i].begin || fresh[i].end != cached[i].end || fresh[i].deviceAddress != cached[i].deviceAddress || fresh[i].permissions != cached[i].permissions) {
+                        std::fprintf(stderr, "[bda-table]   fresh %s | cached %s\n", show(fresh, i).c_str(), show(cached, i).c_str());
+                        break;
+                    }
+                }
+                std::fflush(stderr);
+                std::abort();
+            }
+        }
         writeTableSerial = found->second.first;
         writeTableRanges = found->second.second;
     } else {
+        if (verifyTable) tableMisses.fetch_add(1, std::memory_order_relaxed);
         writeTableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(AddressRanges());
         writeTableSerial = Spaces().serials.fetch_add(1, std::memory_order_relaxed) + 1;
         if (space->writeTables.size() >= 64u) space->writeTables.erase(space->writeTables.begin());

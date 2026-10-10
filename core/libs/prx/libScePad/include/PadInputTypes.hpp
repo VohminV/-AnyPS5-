@@ -18,10 +18,7 @@ enum class InputControl {
     RightStickUp,
     RightStickDown,
     TouchLeft,
-    TouchRight,
-    ToggleMouse,
-    ToggleFullscreen,
-    ToggleHelp
+    TouchRight
 };
 
 enum class PadButton : std::uint32_t {

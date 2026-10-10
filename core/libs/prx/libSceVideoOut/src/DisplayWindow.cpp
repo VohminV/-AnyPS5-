@@ -4,7 +4,10 @@
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "SDL_vulkan.h"
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -38,20 +41,64 @@ void DisplayWindow::Ensure(std::uint32_t sourceWidth, std::uint32_t sourceHeight
 }
 
 void DisplayWindow::create(std::uint32_t sourceWidth, std::uint32_t sourceHeight) {
+    // Window mode is driven by the launcher via environment (defaults = Full HD windowed):
+    //   ANYPS5_WINDOW_MODE = windowed | borderless | fullscreen (default windowed)
+    //   ANYPS5_WINDOW_W / ANYPS5_WINDOW_H = requested client size (default 1920x1080)
+    // The game image itself keeps 16:9 via the aspect subclass + presentation letterbox.
+    const char* modeEnv = std::getenv("ANYPS5_WINDOW_MODE");
+    const std::string mode = modeEnv != nullptr ? modeEnv : "windowed";
+    const auto parseExtent = [](const char* name, long fallback) {
+        const char* raw = std::getenv(name);
+        if (raw == nullptr || *raw == '\0') return fallback;
+        char* end = nullptr;
+        const long value = std::strtol(raw, &end, 10);
+        if (end == raw || value < 320 || value > 7680) return fallback;
+        return value;
+    };
+    long reqW = parseExtent("ANYPS5_WINDOW_W", 1920);
+    long reqH = parseExtent("ANYPS5_WINDOW_H", 1080);
+    // Keep 16:9 when the requested size is not (e.g. smaller monitor): shrink to fit.
     SDL_Rect usable{};
     require(SDL_GetDisplayUsableBounds(0, &usable) == 0, SDL_GetError());
-    require(DisplayWindowInitialSizePercent > 0 && DisplayWindowInitialSizePercent <= 100, "initial window size percent must be between 1 and 100");
     require(usable.w > 0 && usable.h > 0, "usable display extent must be positive");
-    const auto boundsWidth = static_cast<std::uint32_t>(static_cast<std::uint64_t>(usable.w) * DisplayWindowInitialSizePercent / 100);
-    const auto boundsHeight = static_cast<std::uint32_t>(static_cast<std::uint64_t>(usable.h) * DisplayWindowInitialSizePercent / 100);
-    const auto initialSize = AgcDriver::ComputeContainSize_nid_postfix(sourceWidth, sourceHeight, boundsWidth, boundsHeight, true);
-    require(initialSize.width >= DisplayWindowMinimumWidth && initialSize.height >= DisplayWindowMinimumHeight, "initial window extent is smaller than the minimum");
+    if (reqW > usable.w || reqH > usable.h) {
+        const double scale = std::min(static_cast<double>(usable.w) / reqW, static_cast<double>(usable.h) / reqH);
+        reqW = static_cast<long>(reqW * scale);
+        reqH = static_cast<long>(reqH * scale);
+    }
     const auto title = GetAppTitle_nid_postfix();
     AgcDriverLockVulkanLoader_nid_postfix();
-    window = SDL_CreateWindow(title.value, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, static_cast<int>(initialSize.width), static_cast<int>(initialSize.height), SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-    AgcDriverUnlockVulkanLoader_nid_postfix();
-    require(window != nullptr, SDL_GetError());
+    if (mode == "fullscreen") {
+        const auto initialSize = AgcDriver::ComputeContainSize_nid_postfix(sourceWidth, sourceHeight,
+            static_cast<std::uint32_t>(usable.w), static_cast<std::uint32_t>(usable.h), true);
+        window = SDL_CreateWindow(title.value, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+            static_cast<int>(initialSize.width), static_cast<int>(initialSize.height),
+            SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_FULLSCREEN_DESKTOP);
+        AgcDriverUnlockVulkanLoader_nid_postfix();
+        require(window != nullptr, SDL_GetError());
+        if ((SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) == 0) {
+            require(SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP) == 0, SDL_GetError());
+        }
+    } else if (mode == "borderless") {
+        window = SDL_CreateWindow(title.value, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+            usable.w, usable.h,
+            SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_BORDERLESS);
+        AgcDriverUnlockVulkanLoader_nid_postfix();
+        require(window != nullptr, SDL_GetError());
+        SDL_SetWindowPosition(window, usable.x, usable.y);
+    } else {
+        // windowed (default): Full HD 1920x1080 when it fits, else scaled 16:9 fit.
+        const auto initialSize = AgcDriver::ComputeContainSize_nid_postfix(sourceWidth, sourceHeight,
+            static_cast<std::uint32_t>(reqW), static_cast<std::uint32_t>(reqH), true);
+        require(initialSize.width >= DisplayWindowMinimumWidth && initialSize.height >= DisplayWindowMinimumHeight, "initial window extent is smaller than the minimum");
+        window = SDL_CreateWindow(title.value, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+            static_cast<int>(initialSize.width), static_cast<int>(initialSize.height),
+            SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+        AgcDriverUnlockVulkanLoader_nid_postfix();
+        require(window != nullptr, SDL_GetError());
+    }
     SDL_SetWindowMinimumSize(window, static_cast<int>(DisplayWindowMinimumWidth), static_cast<int>(DisplayWindowMinimumHeight));
+    SDL_RaiseWindow(window);
     installSubclass();
 }
 
@@ -75,19 +122,6 @@ void DisplayWindow::ToggleFullscreen() {
     require(window != nullptr, "window must exist before toggling fullscreen");
     const auto flags = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0 ? 0u : static_cast<Uint32>(SDL_WINDOW_FULLSCREEN_DESKTOP);
     require(SDL_SetWindowFullscreen(window, flags) == 0, SDL_GetError());
-}
-
-void DisplayWindow::SetHelpText(std::string text) {
-    helpText = std::move(text);
-}
-
-bool DisplayWindow::ShowingHelp() const {
-    return !helpText.empty();
-}
-
-void DisplayWindow::ShowHelpDialog(const std::string& body) {
-    require(window != nullptr, "window must exist before showing the help dialog");
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Keyboard and mouse bindings", body.c_str(), window);
 }
 
 void DisplayWindow::DrawableSize(std::uint32_t& width, std::uint32_t& height) const {
@@ -120,12 +154,20 @@ void DisplayWindow::UpdateTitle() {
         fpsFrames = 0;
     }
     char text[512];
-    if (!helpText.empty()) {
-        std::snprintf(text, sizeof(text), "%s | FPS: %.2f | %s", title.value, currentFps, helpText.c_str());
-    } else {
-        std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu) | F1:Keys", title.value, currentFps, static_cast<unsigned long long>(frameNum));
+    // Gamepad-only header: title + FPS, no keyboard hints (no F1/Keys line).
+    std::snprintf(text, sizeof(text), "%s | FPS: %.2f", title.value, currentFps);
+    // The title feeds OBS window matching: calling SDL_SetWindowTitle on every
+    // present made it churn each frame (it used to carry a frame counter),
+    // forcing WGC captures to re-initialize (black screen plus an ever-new
+    // entry in OBS's window list) and costing a Win32 round-trip per frame.
+    // Refresh at most twice a second and only when the readout changed.
+    static std::uint64_t lastSet = 0;
+    static char lastText[512] = "";
+    if (now - lastSet >= frequency / 2 && std::strcmp(text, lastText) != 0) {
+        SDL_SetWindowTitle(window, text);
+        std::strcpy(lastText, text);
+        lastSet = now;
     }
-    SDL_SetWindowTitle(window, text);
 }
 
 void DisplayWindow::installSubclass() {

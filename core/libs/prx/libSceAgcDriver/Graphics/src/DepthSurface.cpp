@@ -7,9 +7,11 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -93,12 +95,43 @@ public:
         const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
         const auto format = ResolveTextureFormat(resource.format);
         const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
-        if ((format != expected && !depthBits) || resource.dimension != TextureDimension::k2D || resource.width != target.extent.width || resource.height != target.extent.height || resource.baseLevel != 0 || resource.lastLevel != 0 || resource.baseArray != 0) {
-            char text[448];
-            std::snprintf(text, sizeof(text), "AGC graphics: sampling the %s plane of depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u texture of guest format %u (vk %d), tile mode %u, dimension %d, levels %u-%u, slice %u is not implemented (T# %08x %08x %08x %08x %08x %08x %08x %08x)",
+        if (format != expected && !depthBits) {
+            // Not a depth/stencil view of this surface at all (e.g. a BC7 color
+            // texture reusing the address after the surface died): the tracked
+            // surface is stale for this descriptor. Return nullptr so the normal
+            // snapshot path serves current guest memory instead of crashing the
+            // title. Logged (once per surface) to keep the reuse visible.
+            static std::set<std::uint64_t> logged;
+            if (logged.insert(target.address).second && logged.size() < 64) {
+                std::fprintf(stderr, "[gpu] depth surface 0x%llx: descriptor is guest format %u, not a depth view; falling back to snapshot path\n",
+                    static_cast<unsigned long long>(target.address), resource.format);
+            }
+            return nullptr;
+        }
+        const bool shapeMatches = resource.dimension == TextureDimension::k2D && resource.width == target.extent.width && resource.height == target.extent.height && resource.baseLevel == 0 && resource.lastLevel == 0 && resource.baseArray == 0;
+        // Titles sample the stencil plane through its pitch-aligned allocation view
+        // (e.g. a 1920x1080 D32S8 surface sampled as 2048x1152 R8), which is larger
+        // than the render extent the image was created with. The extra texels were
+        // never rendered and sample as edge texels; refusing the view crashes the
+        // title, so serve the live image instead. Anything else still throws:
+        // a genuinely alien descriptor must stay loud, not silently mis-sampled.
+        // APS5_STRICT_DEPTH_VIEWS=1 restores the old throwing behaviour.
+        static const bool strictViews = std::getenv("APS5_STRICT_DEPTH_VIEWS") != nullptr;
+        const bool alignedStencilView = stencil && format == expected && resource.dimension == TextureDimension::k2D &&
+            resource.baseLevel == 0 && resource.lastLevel == 0 && resource.baseArray == 0 &&
+            resource.width >= target.extent.width && resource.height >= target.extent.height &&
+            resource.width <= target.extent.width * 2 && resource.height <= target.extent.height * 2;
+        if (!shapeMatches) {
+            if (alignedStencilView && !strictViews) {
+                std::fprintf(stderr, "[gpu] depth surface 0x%llx: serving pitch-aligned stencil view %ux%u over %ux%u image\n",
+                    static_cast<unsigned long long>(target.address), resource.width, resource.height, target.extent.width, target.extent.height);
+            } else {
+                char text[448];
+                std::snprintf(text, sizeof(text), "AGC graphics: sampling the %s plane of depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u texture of guest format %u (vk %d), tile mode %u, dimension %d, levels %u-%u, slice %u is not implemented (T# %08x %08x %08x %08x %08x %08x %08x %08x)",
                           stencil ? "stencil" : "depth", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), resource.width, resource.height, resource.format, static_cast<int>(format),
                           static_cast<unsigned>(resource.tileMode), static_cast<int>(resource.dimension), resource.baseLevel, resource.lastLevel, resource.baseArray, key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]);
-            throw std::runtime_error(text);
+                throw std::runtime_error(text);
+            }
         }
         auto texture = std::make_shared<Texture>(context, image, target.format, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components);
         textures.emplace(key, texture);
@@ -169,7 +202,22 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
         return surface->context.device == context.device && (surface->target.address == resource.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
     });
-    return found == list.rend() ? nullptr : (*found)->Sampled(words, resource, components);
+    if (found == list.rend()) return nullptr;
+    const auto& target = (*found)->target;
+    const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
+    // Same pitch-aligned stencil allocation view as Sampled() below: let it
+    // through to the live image instead of treating it as reused memory.
+    const bool alignedStencilView = stencil && resource.dimension == TextureDimension::k2D &&
+        resource.baseLevel == 0 && resource.lastLevel == 0 && resource.baseArray == 0 &&
+        resource.width >= target.extent.width && resource.height >= target.extent.height &&
+        resource.width <= target.extent.width * 2 && resource.height <= target.extent.height * 2;
+    if ((resource.width != target.extent.width || resource.height != target.extent.height) && !alignedStencilView) return nullptr;
+    if (!stencil) {
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const bool depthBits = words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
+        if (ResolveTextureFormat(resource.format) != (d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT) && !depthBits) return nullptr;
+    }
+    return (*found)->Sampled(words, resource, components);
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {

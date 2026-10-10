@@ -114,6 +114,49 @@ VkFormat AttachmentProxyFormat(const Context& context, VkFormat format);
 // either at once (WriteBack) or deferred: MarkDirty keeps them on the GPU until something reads that
 // memory (FlushPending, through the GuestMemory flush hook), the image is refreshed after a CPU write,
 // or it leaves the cache. Dispatches reusing the image meanwhile skip the round trip entirely.
+
+// Pure decision predicate for the untracked-range Refresh rescue (see Refresh
+// in Texture.cpp): given the slow-path findings, whether the rescue may run
+// its byte-compare proof, or which gate already forbids it. Pure so unit
+// tests can pin the gate order; the impure proof itself (mapping counter,
+// pending-registry scan, guest compare) stays inline in Refresh.
+enum class UntrackedRescueVerdict {
+    Rescue,
+    SkipKeysChanged,
+    SkipCpuWrote,
+    SkipTrackedPending,
+    SkipAlias,
+    Count
+};
+UntrackedRescueVerdict DecideUntrackedRescue(bool keysChanged, bool cpuWrote, bool untrackedPendingOnly, bool hasAlias);
+const char* UntrackedRescueVerdictName(UntrackedRescueVerdict verdict);
+// Pure decision predicate for the resident fast-path of untracked (generation
+// == 0, host-imported) surfaces in StorageTexture::Refresh: whether the cheap
+// gates allow attempting the byte-compare/memo proof, or which gate already
+// forbids it. Pure so unit tests can pin the gate order; the impure proof
+// (owner identity, pending-registry scan, mapping serial, guest compare)
+// stays inline in Refresh. Unlike the global write-watch `generation` (which
+// never advances for write-watch-excluded imports and stays 0), this proof
+// distinguishes write state (pending flags), content version (image version)
+// and resident validity (snapshot + memo + owner + keys). MarkDirty() alone
+// is never treated as proof of a completed GPU write: it only bumps the
+// pending serial, which forces a re-compare. Unknown state keeps the slow
+// path.
+enum class ResidentReuseVerdict {
+    // All cheap gates passed: the caller may try the memo hit, else the
+    // byte-compare against the untracked snapshot.
+    AttemptProof,
+    SkipNoSnapshot,
+    SkipOwnerChanged,
+    SkipBorrowed,
+    SkipKeysUnproved,
+    SkipKeysDiffer,
+    SkipForeignPending,
+    SkipRemapped,
+    Count
+};
+ResidentReuseVerdict DecideResidentReuse(bool snapshotValid, bool ownerCurrent, bool hasBorrowed, bool keysProved, bool keysEqual, bool hasForeignPending, bool remapped);
+const char* ResidentReuseVerdictName(ResidentReuseVerdict verdict);
 class StorageTexture : public std::enable_shared_from_this<StorageTexture> {
 public:
     StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
@@ -474,11 +517,53 @@ private:
     std::uint64_t version = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     bool originalValid = true;
+    // The guest allocation covering the surface when its contents were last
+    // synced from guest memory (creation/upload): if the range is later
+    // re-registered under another allocation (freed texture memory reused,
+    // e.g. for job data), pending GPU results are stale for the new owner and
+    // the write-back drops them instead of storing over live bytes. Zero
+    // when unknown (never skip the store for lack of a baseline).
+    std::uint64_t ownerAllocBase = 0;
+    std::size_t ownerAllocBytes = 0;
+    void noteOwnerSynced();
+    // True when the surface's memory is still registered under the synced
+    // owner (or no baseline was ever recorded).
+    bool ownerCurrent() const;
+    // Untracked-range snapshot for the Refresh rescue (see Refresh in
+    // Texture.cpp): a copy of the committed guest bytes the image was last
+    // synced from, with the mapping-generation counter then. The direct
+    // upload path never fills `original`, so without this the rescue has no
+    // ground truth for import-backed (write-watch-excluded) ranges and every
+    // Refresh re-uploads. Used ONLY by the rescue byte-compare, never as an
+    // upload base and never by write-back (which keeps its own re-read when
+    // `originalValid` is false), so all other flows are untouched. Content is
+    // guest ground truth independent of image state: no clearing is needed on
+    // image-state changes; mapping changes are caught by the forget-serial
+    // gate and the compare itself at use time.
+    bool untrackedSnapshotValid = false;
+    std::uint64_t untrackedSnapshotForgetSerial = 0;
+    // Epoch-scoped memo of the rescue proof (see Refresh): the inputs the
+    // proof depended on. A hit skips only the guest byte-compare; the cheap
+    // gates (keys, pending-registry scan) still run live. Staleness contract
+    // matches the collect-epoch memo (GuestMemory.hpp): a guest write landing
+    // between the proof and the hit inside one epoch is seen by the next
+    // epoch, which any queue ordering point starts. No explicit invalidation:
+    // stale values simply miss (any version/pending/owner/keys change moves
+    // at least one of the memo inputs, and mapping changes move the
+    // forget serial).
+    struct UntrackedRescueMemo {
+        bool valid = false;
+        std::uint64_t epoch = 0;
+        std::uint64_t pendingSerial = 0;
+        std::uint64_t forgetSerial = 0;
+        DccKeys keys = DccKeys::Uncompressed;
+    };
+    UntrackedRescueMemo untrackedRescueMemo;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;
     std::atomic<bool> cached{false};
-    // The present a consumer last proved the image current at (NoteProved).
+        // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};
     // Hook skips of this image since FlushPending last listed it (AccessKeptByCpu), the read site
     // of the last one (a GuestMemory::ReadSite), and the first pending layer under its access with

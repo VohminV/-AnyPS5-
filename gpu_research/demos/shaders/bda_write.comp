@@ -1,0 +1,16 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+// Writes a 32-bit pattern through a raw device address passed in push constants.
+// Mirrors our engine's BDA path: the address must come from
+// vkGetBufferDeviceAddress; Aligned is a promise (see the BDA alignment guide
+// page); out-of-bounds through a raw pointer is UB with no robustness.
+layout(buffer_reference, buffer_reference_align = 8, std430) buffer Slots {
+    uint values[];
+};
+layout(push_constant) uniform Registers {
+    Slots slots;
+    uint pattern;
+} registers;
+void main() {
+    registers.slots.values[gl_GlobalInvocationID.x] = registers.pattern;
+}

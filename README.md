@@ -28,7 +28,7 @@ See the [game compatibility list](docs/user/COMPATIBILITY.md) for tested games a
 
 ## Input mapping
 
-SDL-mapped game controllers are supported, including analog sticks and triggers. Keyboard and mouse controls can be configured with an `anyps5-input.ini` file. See [input mapping](docs/user/INPUT_MAPPING.md) for the supported devices and configuration format.
+SDL-mapped game controllers are supported, including analog sticks and triggers. The gamepad (Xbox/PS layout via SDL_GameController) is the only pad input; keyboard/mouse pad bindings were removed. The window starts in fullscreen and the title shows only FPS. See [input mapping](docs/user/INPUT_MAPPING.md) for the controller layout.
 
 ## Disclaimer
 

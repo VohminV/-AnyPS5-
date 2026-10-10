@@ -46,7 +46,7 @@ struct BufferAllocation {
 //
 // Device-local allocations (the detiler's scratch buffers and the staging shadows of written guest
 // buffers, see GuestBufferMemory) are retained in a third tier with a budget of their own, video
-// memory instead of pinned host memory: APS5_STAGING_POOL_MIB (default 512); 0 keeps them in the
+// memory instead of pinned host memory: APS5_STAGING_POOL_MIB (default 768); 0 keeps them in the
 // two host tiers as before.
 class BufferPool {
 public:

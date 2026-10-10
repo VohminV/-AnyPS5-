@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include <cstdlib>
+#include <string>
 
 namespace AgcDriver {
 
@@ -144,7 +146,31 @@ void PresentationScaler::RecordBlit(VkCommandBuffer commands, VkImage destinatio
 
 void PresentationScaler::RecordBlitFrom(const Graphics::Context& context, VkCommandBuffer commands, VkImage image, VkImageLayout layout, std::uint32_t width, std::uint32_t height, VkFilter filter, VkImage destinationImage, std::uint32_t destinationWidth, std::uint32_t destinationHeight) {
     Graphics::Require(image != VK_NULL_HANDLE && width != 0 && height != 0, "presentation blit source is unavailable");
-    const auto rect = ComputeContainRect_nid_postfix(width, height, destinationWidth, destinationHeight);
+    // Scaling mode from the launcher (default fit = 16:9 letterbox, no stretch):
+    //   ANYPS5_SCALING = fit | fill | integer
+    // fit: contain + linear (existing behaviour). fill: stretch full dest (may
+    // stretch pixels). integer: largest integer factor that fits, centered,
+    // nearest filter (crisp pixels, no blur from double scaling).
+    static const std::string scaling = [] {
+        const char* raw = std::getenv("ANYPS5_SCALING");
+        return raw != nullptr ? std::string(raw) : std::string("fit");
+    }();
+    AspectFitRect rect{};
+    VkFilter activeFilter = filter;
+    if (scaling == "fill") {
+        rect = AspectFitRect{0, 0, destinationWidth, destinationHeight};
+    } else if (scaling == "integer") {
+        std::uint32_t factor = 1;
+        while ((width * (factor + 1) <= destinationWidth) && (height * (factor + 1) <= destinationHeight)) ++factor;
+        const std::uint32_t w = width * factor;
+        const std::uint32_t h = height * factor;
+        rect = AspectFitRect{
+            static_cast<std::int32_t>((static_cast<std::int64_t>(destinationWidth) - w) / 2),
+            static_cast<std::int32_t>((static_cast<std::int64_t>(destinationHeight) - h) / 2), w, h};
+        activeFilter = VK_FILTER_NEAREST;
+    } else {
+        rect = ComputeContainRect_nid_postfix(width, height, destinationWidth, destinationHeight);
+    }
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.srcOffsets[0] = {0, 0, 0};
@@ -152,7 +178,7 @@ void PresentationScaler::RecordBlitFrom(const Graphics::Context& context, VkComm
     blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.dstOffsets[0] = {rect.x, rect.y, 0};
     blit.dstOffsets[1] = {rect.x + static_cast<std::int32_t>(rect.width), rect.y + static_cast<std::int32_t>(rect.height), 1};
-    context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage")(commands, image, layout, destinationImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
+    context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage")(commands, image, layout, destinationImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, activeFilter);
 }
 
 }

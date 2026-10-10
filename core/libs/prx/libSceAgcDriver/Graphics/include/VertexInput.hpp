@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -154,7 +155,15 @@ inline std::size_t VertexBufferReadSize(const ShaderRecompiler::VertexAttribute&
     Require(attribute.fetchIndex <= 1, "unsupported vertex fetch index");
     const auto index = attribute.fetchIndex == 0 ? maxIndex : firstInstance + instances - 1u;
     const auto bytes = DecodeVertexFormat(attribute).bytes;
-    Require(stride == 0 || index < records, "vertex fetch exceeds descriptor record count");
+    // Values in the message: a corrupted index buffer shows an insane index
+    // against sane records, a corrupted descriptor the reverse. Both live in
+    // guest memory; join the buffer address against the write journal.
+    if (!(stride == 0 || index < records)) {
+        const auto address = attribute.resource.fields[0] | (static_cast<std::uint64_t>(attribute.resource.fields[1] & 0xffffu) << 32u);
+        char text[256];
+        std::snprintf(text, sizeof(text), "vertex fetch exceeds descriptor record count (index %u, records %u, stride %u, instances %u, buffer 0x%llx, fetch %u)", index, records, stride, instances, static_cast<unsigned long long>(address), attribute.fetchIndex);
+        throw std::runtime_error(text);
+    }
     const auto available = stride == 0 ? static_cast<std::uint64_t>(records) : static_cast<std::uint64_t>(records) * stride;
     const auto required = static_cast<std::uint64_t>(stride) * index + bytes;
     Require(required <= available && required <= std::numeric_limits<std::size_t>::max(), "vertex fetch exceeds descriptor byte range");

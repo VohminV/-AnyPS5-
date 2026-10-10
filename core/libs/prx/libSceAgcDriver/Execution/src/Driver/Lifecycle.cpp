@@ -80,6 +80,18 @@ void Driver::CheckFailure() {
 
 void Driver::ReportFailure(std::exception_ptr error) {
     require(error != nullptr, "null asynchronous failure");
+    // Diagnostic: name the reporting thread and the first failure. The
+    // presenter rethrows this later as "[videoout] presentation failed",
+    // which hides where the failure came from (queue worker, presenter,
+    // or a game thread resolving a shader ABI).
+    try {
+        std::rethrow_exception(error);
+    } catch (const std::exception& failure) {
+        std::fprintf(stderr, "[gpu] failure reported: %s (worker=%d)\n", failure.what(), onWorkerThread() ? 1 : 0);
+    } catch (...) {
+        std::fprintf(stderr, "[gpu] failure reported: non-standard exception (worker=%d)\n", onWorkerThread() ? 1 : 0);
+    }
+    std::fflush(stderr);
     {
         std::lock_guard lock(mutex);
         if (!failure) failure = error;

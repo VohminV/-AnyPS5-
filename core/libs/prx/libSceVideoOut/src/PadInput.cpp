@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,7 +13,9 @@
 #include "prx/libc/include/General.hpp"
 
 PadInput::PadInput()
-    : bindings(Pad::LoadInputMapping()), pressed(bindings.size()), wheelReleaseTimes(bindings.size()) {
+    : bindings(Pad::LoadInputMapping()) {
+    // Gamepad-only: bindings is always empty. Xbox/PS controllers are handled
+    // purely through SDL_GameController in sampleController() below.
     openFirstAvailableController();
 }
 
@@ -70,6 +71,11 @@ void PadInput::closeController() {
 }
 
 void PadInput::applyOutput() {
+    // ANYPS5_RUMBLE=0 disables all force feedback (real toggle for the launcher).
+    static const bool rumbleEnabled = [] {
+        const char* raw = std::getenv("ANYPS5_RUMBLE");
+        return raw == nullptr || std::string(raw) != "0";
+    }();
     PadOutputState fetched;
     if (PadFetchOutput_nid_postfix(&outputSequence, &fetched)) {
         const bool motionChanged = fetched.motionEnabled != outputState.motionEnabled;
@@ -89,6 +95,11 @@ void PadInput::applyOutput() {
     outputPending = false;
     nextRumbleRefresh = now + std::chrono::milliseconds(700);
     constexpr Uint32 rumbleMs = 2000;
+    if (!rumbleEnabled) {
+        // Hard stop: never rumble when disabled, and stop any active effect.
+        SDL_GameControllerRumble(controller, 0, 0, 0);
+        return;
+    }
     SDL_GameControllerRumble(controller, static_cast<Uint16>(outputState.vibrationLarge * 257), static_cast<Uint16>(outputState.vibrationSmall * 257), rumbling ? rumbleMs : 0);
     if (SDL_GameControllerHasLED(controller) == SDL_TRUE) {
         if (outputState.lightBarValid) SDL_GameControllerSetLED(controller, outputState.lightBar[0], outputState.lightBar[1], outputState.lightBar[2]);
@@ -107,16 +118,6 @@ void PadInput::applyOutput() {
     }
 }
 
-void PadInput::setMouseMode(bool enabled) {
-    if (SDL_SetRelativeMouseMode(enabled ? SDL_TRUE : SDL_FALSE) != 0) throw std::runtime_error(std::string("Pad: relative mouse mode failed: ") + SDL_GetError());
-    int deltaX = 0;
-    int deltaY = 0;
-    SDL_GetRelativeMouseState(&deltaX, &deltaY);
-    mouseEnabled = enabled;
-    mouseStick = {128, 128};
-    nextMousePoll = std::chrono::steady_clock::now() + std::chrono::milliseconds(Pad::MousePollIntervalMs);
-}
-
 PadInputState PadInput::sampleController() const {
     PadInputState result;
     if (controller == nullptr) return result;
@@ -126,8 +127,24 @@ PadInputState PadInput::sampleController() const {
     const auto addButton = [&result, &readButton](SDL_GameControllerButton source, Pad::PadButton button) {
         if (readButton(source)) result.buttons |= static_cast<std::uint32_t>(button);
     };
-    addButton(SDL_CONTROLLER_BUTTON_A, Pad::PadButton::Cross);
-    addButton(SDL_CONTROLLER_BUTTON_B, Pad::PadButton::Circle);
+    // Standard Xbox <-> PlayStation layout (verified against SDL docs):
+    // Xbox A (south) -> Cross (south), B (east) -> Circle (east),
+    // X (west) -> Square (west), Y (north) -> Triangle (north).
+    // LB/RB -> L1/R1, LT/RT axes -> analog L2/R2, Menu/Start -> Options,
+    // View/Back -> TouchPad tap emulation (Xbox has no touchpad),
+    // D-pad + stick clicks map 1:1.
+    // ANYPS5_SWAP_AB=1 swaps A/B (Cross/Circle) for users with a swapped layout.
+    static const bool swapAB = [] {
+        const char* raw = std::getenv("ANYPS5_SWAP_AB");
+        return raw != nullptr && std::string(raw) == "1";
+    }();
+    if (!swapAB) {
+        addButton(SDL_CONTROLLER_BUTTON_A, Pad::PadButton::Cross);
+        addButton(SDL_CONTROLLER_BUTTON_B, Pad::PadButton::Circle);
+    } else {
+        addButton(SDL_CONTROLLER_BUTTON_A, Pad::PadButton::Circle);
+        addButton(SDL_CONTROLLER_BUTTON_B, Pad::PadButton::Cross);
+    }
     addButton(SDL_CONTROLLER_BUTTON_X, Pad::PadButton::Square);
     addButton(SDL_CONTROLLER_BUTTON_Y, Pad::PadButton::Triangle);
     addButton(SDL_CONTROLLER_BUTTON_LEFTSHOULDER, Pad::PadButton::L1);
@@ -157,12 +174,25 @@ PadInputState PadInput::sampleController() const {
         const auto value = static_cast<std::int32_t>(SDL_GameControllerGetAxis(controller, axis)) + 32768;
         return static_cast<std::uint8_t>((value * 255 + 32767) / 65535);
     };
-    result.sticks = {
-        stickValue(SDL_CONTROLLER_AXIS_LEFTX),
-        stickValue(SDL_CONTROLLER_AXIS_LEFTY),
-        stickValue(SDL_CONTROLLER_AXIS_RIGHTX),
-        stickValue(SDL_CONTROLLER_AXIS_RIGHTY)
+    // ANYPS5_STICK_DEADZONE: radial deadzone in 0..255 units around center 128
+    // (default 10). Prevents drift on worn Chinese sticks without killing response.
+    static const int deadzone = [] {
+        const char* raw = std::getenv("ANYPS5_STICK_DEADZONE");
+        if (raw == nullptr || *raw == '\0') return 10;
+        char* end = nullptr;
+        const long v = std::strtol(raw, &end, 10);
+        if (end == raw || v < 0 || v > 64) return 10;
+        return static_cast<int>(v);
+    }();
+    auto axis = stickValue(SDL_CONTROLLER_AXIS_LEFTX);
+    auto axisY = stickValue(SDL_CONTROLLER_AXIS_LEFTY);
+    auto axisRX = stickValue(SDL_CONTROLLER_AXIS_RIGHTX);
+    auto axisRY = stickValue(SDL_CONTROLLER_AXIS_RIGHTY);
+    const auto applyDz = [](std::uint8_t v) {
+        const int d = static_cast<int>(v) - 128;
+        return (d < 0 ? -d : d) <= deadzone ? std::uint8_t{128} : v;
     };
+    result.sticks = {applyDz(axis), applyDz(axisY), applyDz(axisRX), applyDz(axisRY)};
     switch (SDL_GameControllerGetType(controller)) {
         case SDL_CONTROLLER_TYPE_PS5: result.deviceKind = 1; break;
         case SDL_CONTROLLER_TYPE_PS4: result.deviceKind = 2; break;
@@ -195,6 +225,7 @@ PadInputState PadInput::sampleController() const {
 }
 
 void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
+    static_cast<void>(window);
     if (event.type == SDL_CONTROLLERDEVICEADDED) {
         openController(event.cdevice.which);
         return;
@@ -213,64 +244,8 @@ void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
         publish();
         return;
     }
-    if (event.type == SDL_WINDOWEVENT && (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST || event.window.event == SDL_WINDOWEVENT_CLOSE)) {
-        std::fill(pressed.begin(), pressed.end(), false);
-        std::fill(wheelReleaseTimes.begin(), wheelReleaseTimes.end(), std::chrono::steady_clock::time_point{});
-        if (mouseEnabled) setMouseMode(false);
-        publish();
-        return;
-    }
-    // APS5_NO_PAD_INPUT=1 keeps a measurement run from reacting to keys or mouse buttons that reach
-    // its window (a stray press advances the title into another stage).
-    static const bool ignoreInput = std::getenv("APS5_NO_PAD_INPUT") != nullptr;
-    if (ignoreInput && event.type == SDL_MOUSEWHEEL) return;
-    if (event.type == SDL_MOUSEWHEEL) {
-        int direction = (event.wheel.y > 0) - (event.wheel.y < 0);
-        if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) direction = -direction;
-        if (direction == 0) return;
-        const auto releaseTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(Pad::WheelPressDurationMs);
-        for (std::size_t index = 0; index < bindings.size(); ++index) {
-            const auto& binding = bindings[index];
-            if (binding.wheelDirection == 0) continue;
-            pressed[index] = binding.wheelDirection == direction;
-            wheelReleaseTimes[index] = pressed[index] ? releaseTime : std::chrono::steady_clock::time_point{};
-        }
-        publish();
-        return;
-    }
-    const bool keyboard = event.type == SDL_KEYDOWN || event.type == SDL_KEYUP;
-    const bool mouse = event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP;
-    if (!keyboard && !mouse) return;
-    if (ignoreInput) return;
-    if (keyboard && event.key.repeat != 0) return;
-    const bool down = event.type == SDL_KEYDOWN || event.type == SDL_MOUSEBUTTONDOWN;
-    for (std::size_t index = 0; index < bindings.size(); ++index) {
-        const auto& binding = bindings[index];
-        const bool matches = keyboard
-            ? binding.key != SDL_SCANCODE_UNKNOWN && binding.key == event.key.keysym.scancode
-            : binding.mouseButton != Pad::MouseButton::None && binding.mouseButton == static_cast<Pad::MouseButton>(event.button.button);
-
-        if (!matches) continue;
-        if (binding.control == Pad::InputControl::ToggleFullscreen) {
-            if (keyboard && down && !pressed[index] && window.Handle() != nullptr && event.key.windowID == SDL_GetWindowID(window.Handle())) window.ToggleFullscreen();
-        }
-        if (binding.control == Pad::InputControl::ToggleHelp && down && !pressed[index] && window.Handle() != nullptr) {
-            if (window.ShowingHelp()) {
-                window.SetHelpText({});
-            } else {
-                const auto help = Pad::DescribeBindings(bindings);
-                APS5_LOG_OUT("Pad: keyboard/mouse bindings: %s", help.c_str());
-                window.SetHelpText(help);
-                // Modal: the key release can land in the dialog, so never latch pressed here;
-                // the trailing pressed[index] = down below must be skipped as well.
-                window.ShowHelpDialog(Pad::DescribeBindingsFull(bindings));
-            }
-            continue;
-        }
-        if (binding.control == Pad::InputControl::ToggleMouse && down && !pressed[index]) setMouseMode(!mouseEnabled);
-        pressed[index] = down;
-    }
-    publish();
+    // Gamepad-only: keyboard/mouse/wheel events are intentionally ignored.
+    // No ToggleHelp (F1), no ToggleFullscreen (F11), no ToggleMouse.
 }
 
 void PadInput::Update() {
@@ -280,84 +255,9 @@ void PadInput::Update() {
         controllerState = sampleController();
         publish();
     }
-    const auto now = std::chrono::steady_clock::now();
-    bool released = false;
-    for (std::size_t index = 0; index < bindings.size(); ++index) {
-        if (bindings[index].wheelDirection == 0 || !pressed[index] || now < wheelReleaseTimes[index]) continue;
-        pressed[index] = false;
-        wheelReleaseTimes[index] = {};
-        released = true;
-    }
-    if (released) publish();
-    if (!mouseEnabled) return;
-    if (SDL_GetKeyboardFocus() == nullptr) {
-        std::fill(pressed.begin(), pressed.end(), false);
-        std::fill(wheelReleaseTimes.begin(), wheelReleaseTimes.end(), std::chrono::steady_clock::time_point{});
-        setMouseMode(false);
-        publish();
-        return;
-    }
-    if (now < nextMousePoll) return;
-    nextMousePoll = now + std::chrono::milliseconds(Pad::MousePollIntervalMs);
-    int deltaX = 0;
-    int deltaY = 0;
-    SDL_GetRelativeMouseState(&deltaX, &deltaY);
-    mouseStick = {128, 128};
-    if (deltaX != 0 || deltaY != 0) {
-        const double distance = std::hypot(deltaX, deltaY);
-        const double scale = std::clamp(distance * Pad::MouseSensitivity + 16.0, 64.0, 128.0) / distance;
-        const auto mapAxis = [scale](int delta) { return static_cast<std::uint8_t>(std::clamp(128L + std::lround(delta * scale), 0L, 255L)); };
-        mouseStick = {mapAxis(deltaX), mapAxis(deltaY)};
-    }
-    publish();
 }
 
 void PadInput::publish() {
-    PadInputState state;
-    state.buttons = controllerState.buttons;
-    state.sticks = controllerState.sticks;
-    state.analogButtonsL2 = controllerState.analogButtonsL2;
-    state.analogButtonsR2 = controllerState.analogButtonsR2;
-    state.hasMotion = controllerState.hasMotion;
-    state.accel = controllerState.accel;
-    state.gyro = controllerState.gyro;
-    state.touch = controllerState.touch;
-    state.deviceKind = controllerState.deviceKind;
-
-    std::array<bool, 4> negative{};
-    std::array<bool, 4> positive{};
-    for (std::size_t index = 0; index < bindings.size(); ++index) {
-        if (!pressed[index]) continue;
-        const auto& binding = bindings[index];
-        switch (binding.control) {
-            case Pad::InputControl::Button:
-                state.buttons |= static_cast<std::uint32_t>(binding.button);
-                if (binding.button == Pad::PadButton::L2) state.analogButtonsL2 = 255;
-                if (binding.button == Pad::PadButton::R2) state.analogButtonsR2 = 255;
-                break;
-            case Pad::InputControl::LeftStickLeft: negative[0] = true; break;
-            case Pad::InputControl::LeftStickRight: positive[0] = true; break;
-            case Pad::InputControl::LeftStickUp: negative[1] = true; break;
-            case Pad::InputControl::LeftStickDown: positive[1] = true; break;
-            case Pad::InputControl::RightStickLeft: negative[2] = true; break;
-            case Pad::InputControl::RightStickRight: positive[2] = true; break;
-            case Pad::InputControl::RightStickUp: negative[3] = true; break;
-            case Pad::InputControl::RightStickDown: positive[3] = true; break;
-            case Pad::InputControl::TouchLeft: state.touchLeft = true; break;
-            case Pad::InputControl::TouchRight: state.touchRight = true; break;
-            case Pad::InputControl::ToggleMouse: break;
-            case Pad::InputControl::ToggleFullscreen: break;
-            case Pad::InputControl::ToggleHelp: break;
-        }
-    }
-    for (std::size_t axis = 0; axis < state.sticks.size(); ++axis) {
-        if (negative[axis] || positive[axis]) state.sticks[axis] = negative[axis] == positive[axis] ? 128 : negative[axis] ? 0 : 255;
-    }
-    if (mouseEnabled) {
-        state.sticks[2] = mouseStick[0];
-        state.sticks[3] = mouseStick[1];
-    }
-    if (state.analogButtonsL2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::L2);
-    if (state.analogButtonsR2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::R2);
-    PadPublishInput_nid_postfix(state);
+    // Gamepad-only: publish the sampled controller state directly.
+    PadPublishInput_nid_postfix(controllerState);
 }

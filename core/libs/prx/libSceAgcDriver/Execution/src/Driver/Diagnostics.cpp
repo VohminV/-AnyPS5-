@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include <cstdio>
 #include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
@@ -17,7 +18,11 @@ void require(bool condition, const char* reason) {
 
 std::uint32_t readRegister(const Registers& registers, std::uint32_t offset) {
     const auto it = registers.find(offset);
-    require(it != registers.end(), "required shader register has not been written");
+    if (it == registers.end()) {
+        char text[128];
+        std::snprintf(text, sizeof(text), "required shader register 0x%x has not been written (%zu tracked)", offset, registers.size());
+        throw std::runtime_error(std::string("AGC driver: ") + text);
+    }
     return it->second;
 }
 

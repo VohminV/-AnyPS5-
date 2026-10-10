@@ -11,6 +11,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestUnifiedMemory.hpp"
+#include "prx/libc/include/CrashNotes.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -82,10 +85,103 @@ std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWrit
 // whose selected pending units were dropped because their memory is no longer registered (see
 // writeBackLayers), and pending units a DCC clear -> uncompressed key flip kept as the texels
 // (Refresh).
-std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKept{0};
+std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, ownerReusedDropped{0}, keyFlipKept{0};
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
+
+// Refresh-phase breakdown (§3 measurement): where StorageTexture::Refresh
+// spends its wall time, per 10 s next to the [storage] line, plus which
+// addresses re-upload as "untracked". Pure accumulators; no behavior change.
+struct RefreshPhaseTotals {
+    std::atomic<std::uint64_t> calls{0};
+    std::atomic<std::uint64_t> aliasUs{0}, flushUs{0}, collectUs{0}, keysUs{0};
+    std::atomic<std::uint64_t> detectUs{0}, storeUs{0}, uploadUs{0};
+    std::atomic<std::uint64_t> unchangedUs{0}, changedUs{0};
+    std::atomic<std::uint64_t> untrackedUploads{0};
+    std::mutex ringMutex;
+    std::uint64_t ringAddr[8]{};
+    std::uint64_t ringBytes[8]{};
+    std::uint64_t ringCount[8]{};
+    std::size_t ringNext = 0;
+};
+RefreshPhaseTotals& RefreshPhases() {
+    static RefreshPhaseTotals phases;
+    return phases;
+}
+// Untracked-range rescue counters (permanent §3 measurement): snapshots
+// taken, rescues that fired, and which gate forbade the rest.
+std::atomic<std::uint64_t> untrackedSnapshots{0}, untrackedRescueHits{0}, untrackedRescueMemoHits{0};
+std::atomic<std::uint64_t> untrackedRescueSkips[static_cast<std::size_t>(UntrackedRescueVerdict::Count)]{};
+std::atomic<std::uint64_t> untrackedRescueForeign{0}, untrackedRescueCompareMiss{0};
+
+// Kill switch for the untracked-range snapshot + rescue below. Shared with
+// the Refresh fast path (APS5_NO_REFRESH_FAST_PATH=1): when set, no snapshot
+// is taken (the rescue has no ground truth) and the rescue never fires, so
+// the pre-existing slow path runs exactly as before.
+bool UntrackedSnapshotEnabledImpl() {
+    static const bool enabled = std::getenv("APS5_NO_REFRESH_FAST_PATH") == nullptr;
+    return enabled;
+}
+
+UntrackedRescueVerdict DecideUntrackedRescueImpl(bool keysChanged, bool cpuWrote, bool untrackedPendingOnly, bool hasAlias) {
+    if (keysChanged) return UntrackedRescueVerdict::SkipKeysChanged;
+    if (cpuWrote) return UntrackedRescueVerdict::SkipCpuWrote;
+    if (!untrackedPendingOnly) return UntrackedRescueVerdict::SkipTrackedPending;
+    if (hasAlias) return UntrackedRescueVerdict::SkipAlias;
+    return UntrackedRescueVerdict::Rescue;
+}
+
+ResidentReuseVerdict DecideResidentReuseImpl(bool snapshotValid, bool ownerCurrent, bool hasBorrowed, bool keysProved, bool keysEqual, bool hasForeignPending, bool remapped) {
+    if (!snapshotValid) return ResidentReuseVerdict::SkipNoSnapshot;
+    if (!ownerCurrent) return ResidentReuseVerdict::SkipOwnerChanged;
+    if (hasBorrowed) return ResidentReuseVerdict::SkipBorrowed;
+    if (!keysProved) return ResidentReuseVerdict::SkipKeysUnproved;
+    if (!keysEqual) return ResidentReuseVerdict::SkipKeysDiffer;
+    if (hasForeignPending) return ResidentReuseVerdict::SkipForeignPending;
+    if (remapped) return ResidentReuseVerdict::SkipRemapped;
+    return ResidentReuseVerdict::AttemptProof;
+}
+
+const char* ResidentReuseVerdictNameImpl(ResidentReuseVerdict verdict) {
+    switch (verdict) {
+        case ResidentReuseVerdict::AttemptProof: return "attempt";
+        case ResidentReuseVerdict::SkipNoSnapshot: return "no-snapshot";
+        case ResidentReuseVerdict::SkipOwnerChanged: return "owner-changed";
+        case ResidentReuseVerdict::SkipBorrowed: return "borrowed";
+        case ResidentReuseVerdict::SkipKeysUnproved: return "keys-unproved";
+        case ResidentReuseVerdict::SkipKeysDiffer: return "keys-differ";
+        case ResidentReuseVerdict::SkipForeignPending: return "foreign-pending";
+        case ResidentReuseVerdict::SkipRemapped: return "remapped";
+        case ResidentReuseVerdict::Count: break;
+    }
+    return "?";
+}
+
+const char* UntrackedRescueVerdictNameImpl(UntrackedRescueVerdict verdict) {
+    switch (verdict) {
+        case UntrackedRescueVerdict::Rescue: return "rescue";
+        case UntrackedRescueVerdict::SkipKeysChanged: return "keys";
+        case UntrackedRescueVerdict::SkipCpuWrote: return "cpu";
+        case UntrackedRescueVerdict::SkipTrackedPending: return "tracked-pending";
+        case UntrackedRescueVerdict::SkipAlias: return "alias";
+        case UntrackedRescueVerdict::Count: break;
+    }
+    return "?";
+}
+// Adds the elapsed microseconds to `counter` on destruction. Refresh runs on
+// several threads (draw + dispatch workers): relaxed atomics, no mutex.
+struct RefreshPhaseClock {
+    std::atomic<std::uint64_t>& counter;
+    std::chrono::steady_clock::time_point start;
+    bool active;
+    RefreshPhaseClock(std::atomic<std::uint64_t>& counter, bool profile)
+        : counter(counter), start(profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}), active(profile) {}
+    ~RefreshPhaseClock() {
+        if (!active) return;
+        counter.fetch_add(static_cast<std::uint64_t>(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    }
+};
 
 struct StorageTraffic {
     std::mutex mutex;
@@ -127,12 +223,55 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
+    {
+        // FIXNOW-DIAG: Refresh sub-phases, ms per 10 s (changed tail includes
+        // store+upload below; detect includes keys).
+        auto& phases = RefreshPhases();
+        const auto ms = [&](std::atomic<std::uint64_t>& counter) { return take(counter) / 1000.0; };
+        const auto calls = take(phases.calls);
+        const auto untracked = take(phases.untrackedUploads);
+        char addrs[256] = "";
+        {
+            std::lock_guard lock(phases.ringMutex);
+            std::size_t n = 0;
+            for (std::size_t i = 0; i < 8 && n < sizeof(addrs) - 32; ++i) {
+                if (phases.ringAddr[i] == 0) continue;
+                char entry[48];
+                std::snprintf(entry, sizeof(entry), " 0x%llx+%lluMBx%llu", static_cast<unsigned long long>(phases.ringAddr[i]), static_cast<unsigned long long>(phases.ringBytes[i] >> 20), static_cast<unsigned long long>(phases.ringCount[i]));
+                std::strncat(addrs, entry, sizeof(addrs) - std::strlen(addrs) - 1);
+                phases.ringAddr[i] = 0;
+                phases.ringBytes[i] = 0;
+                phases.ringCount[i] = 0;
+            }
+            phases.ringNext = 0;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[refresh-phases] %llu calls (10 s): alias %.1fms flush %.1fms collect %.1fms keys %.1fms detect %.1fms unchanged %.1fms changed %.1fms of it store %.1fms upload %.1fms; untracked uploads %llu addrs:%s\n", static_cast<unsigned long long>(calls), ms(phases.aliasUs), ms(phases.flushUs), ms(phases.collectUs), ms(phases.keysUs), ms(phases.detectUs), ms(phases.unchangedUs), ms(phases.changedUs), ms(phases.storeUs), ms(phases.uploadUs), static_cast<unsigned long long>(untracked), addrs);
+        {
+            // Untracked-range rescue (§3 measurement): snapshots taken,
+            // rescues fired, and which gate forbade the rest.
+            const auto snaps = take(untrackedSnapshots);
+            const auto hits = take(untrackedRescueHits);
+            const auto memoHits = take(untrackedRescueMemoHits);
+            const auto foreign = take(untrackedRescueForeign);
+            const auto compareMiss = take(untrackedRescueCompareMiss);
+            unsigned long long skips[static_cast<std::size_t>(UntrackedRescueVerdict::Count)] = {};
+            for (std::size_t i = 0; i < static_cast<std::size_t>(UntrackedRescueVerdict::Count); ++i) skips[i] = take(untrackedRescueSkips[i]);
+            AgcDriver::ProfilePrint_nid_no_patch("[untracked-rescue] snapshots %llu hits %llu of them memo %llu; skip by gate:", static_cast<unsigned long long>(snaps), static_cast<unsigned long long>(hits), static_cast<unsigned long long>(memoHits));
+            for (std::size_t i = 0; i < static_cast<std::size_t>(UntrackedRescueVerdict::Count); ++i) {
+                if (skips[i] != 0) AgcDriver::ProfilePrint_nid_no_patch(" %s %llu", UntrackedRescueVerdictName(static_cast<UntrackedRescueVerdict>(i)), skips[i]);
+            }
+            AgcDriver::ProfilePrint_nid_no_patch(" foreign-or-remapped %llu compare-miss %llu\n", static_cast<unsigned long long>(foreign), static_cast<unsigned long long>(compareMiss));
+        }
+    }
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
+    GuestUnifiedMemory::MaybeReport(nullptr);
 }
 
 void countStorageUpload(std::size_t path, std::uint64_t bytes) {
+    GuestUnifiedMemory::NoteCpuToGpu(bytes);
+    GuestUnifiedMemory::NoteCopy(bytes);
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
@@ -145,6 +284,7 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
 }
 
 void countStorageWriteBack(std::uint64_t bytes, bool direct) {
+    GuestUnifiedMemory::NoteGpuToCpu(bytes);
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
@@ -210,6 +350,26 @@ VkImageViewType ViewTypeFor(TextureDimension dimension, [[maybe_unused]] std::ui
     throw std::runtime_error("AGC graphics: Texture encountered an unknown guest texture dimension");
 }
 
+}
+
+bool UntrackedSnapshotEnabled() {
+    return UntrackedSnapshotEnabledImpl();
+}
+
+UntrackedRescueVerdict DecideUntrackedRescue(bool keysChanged, bool cpuWrote, bool untrackedPendingOnly, bool hasAlias) {
+    return DecideUntrackedRescueImpl(keysChanged, cpuWrote, untrackedPendingOnly, hasAlias);
+}
+
+const char* UntrackedRescueVerdictName(UntrackedRescueVerdict verdict) {
+    return UntrackedRescueVerdictNameImpl(verdict);
+}
+
+ResidentReuseVerdict DecideResidentReuse(bool snapshotValid, bool ownerCurrent, bool hasBorrowed, bool keysProved, bool keysEqual, bool hasForeignPending, bool remapped) {
+    return DecideResidentReuseImpl(snapshotValid, ownerCurrent, hasBorrowed, keysProved, keysEqual, hasForeignPending, remapped);
+}
+
+const char* ResidentReuseVerdictName(ResidentReuseVerdict verdict) {
+    return ResidentReuseVerdictNameImpl(verdict);
 }
 
 namespace {
@@ -1200,6 +1360,138 @@ bool StorageTexture::Refresh() {
     // flush below and the compare through the hook skip it).
     refreshing = this;
     NoteProved();
+    if (profile) RefreshPhases().calls.fetch_add(1, std::memory_order_relaxed);
+    // Hacker fast-path (RDNA2 hardware rule): a resident image whose texel
+    // stamps and DCC proof are still current is current — no FlushPending, no
+    // CollectWrites page walk, no key rescan. This is exactly what CB/DCC units
+    // do on silicon: coherency by stamps, not by re-reading VRAM per draw.
+    // The image's OWN pending results are exempt (like overlappingPending):
+    // they stay on the GPU, which is the point. Only OTHER pending overlaps,
+    // moved stamps, or a changed proof fall through to the slow path.
+    // Env APS5_NO_REFRESH_FAST_PATH=1 restores the old behavior.
+    static const bool fastRefresh = std::getenv("APS5_NO_REFRESH_FAST_PATH") == nullptr;
+    if (fastRefresh) {
+        const auto size = static_cast<std::size_t>(guestBytes);
+        if (size == 0) {
+            GuestUnifiedMemory::NoteFastSkip(GuestUnifiedMemory::FastSkip::NoGeneration);
+        } else if (generation == 0) {
+            // Resident proof for untracked (write-watch-excluded, usually
+            // host-imported) surfaces. The global `generation` never advances
+            // here (CollectWrites returns 0), so the stamp fast-path below
+            // can never hit and every Refresh fell through to a full
+            // FlushPending + CollectWrites + DCC scan + write-back + upload.
+            // For a render target rewritten by the GPU every frame with no
+            // CPU writes, that is a full round-trip per use (the 22 GB upload
+            // / 16 GB write-back per 10 s window).
+            //
+            // This path does NOT fake a non-zero generation and does NOT treat
+            // MarkDirty() as proof of a completed GPU write. It distinguishes:
+            // write state (pending flags, self-exempt), content version
+            // (bumped on every MarkDirty/upload, which moves the pending
+            // serial and forces a re-compare) and resident validity (snapshot
+            // bytes + epoch/serial/forget/keys memo + owner identity + keys).
+            // Every GPU write from another image (foreign pending), CPU write
+            // (byte-compare miss), alias borrow, backing-resource change
+            // (owner/forget serial) or unproved keys falls through to the
+            // existing slow path. APS5_NO_REFRESH_FAST_PATH=1 disables this
+            // together with the stamp fast-path and the snapshot/rescue.
+            const bool snapshotValid = untrackedSnapshotValid && original.size() == size;
+            const bool hasBorrowed = std::any_of(borrowedUnits.begin(), borrowedUnits.end(), [](bool held) { return held; });
+            DccKeys fastKeys = DccKeys::Uncompressed;
+            bool keysProved = false;
+            if (descriptor.dccAddress == 0) {
+                fastKeys = DccKeys::Uncompressed;
+                keysProved = true;
+            } else if (keyProof.generation != 0) {
+                const std::size_t keyCount = DccKeyBytes(guestBytes);
+                if (keyCount != 0 && GuestMemory::UnchangedSince(descriptor.dccAddress, keyCount, keyProof.generation)) {
+                    fastKeys = keyProof.keys;
+                    keysProved = true;
+                }
+            }
+            const bool foreignPending = !overlappingPending(descriptor.baseAddress, size).empty();
+            const auto epoch = GuestMemory::CollectEpochBumps();
+            const auto serial = PendingSerial();
+            const auto forget = GuestMemory::ForgetSerial();
+            const bool remapped = untrackedSnapshotForgetSerial != forget;
+            const bool ownerOk = ownerCurrent();
+            const auto verdict = DecideResidentReuse(snapshotValid, ownerOk, hasBorrowed, keysProved, fastKeys == uploadedKeys, foreignPending, remapped);
+            if (verdict != ResidentReuseVerdict::AttemptProof) {
+                // Flight recorder: names the gate that forces the expensive slow path.
+                CrashNotef_nid_no_patch("resident-skip", "image=0x%llx %s", static_cast<unsigned long long>(descriptor.baseAddress), ResidentReuseVerdictName(verdict));
+                switch (verdict) {
+                    case ResidentReuseVerdict::SkipNoSnapshot: GuestUnifiedMemory::NoteFastSkip(GuestUnifiedMemory::FastSkip::NoGeneration); break;
+                    case ResidentReuseVerdict::SkipOwnerChanged:
+                    case ResidentReuseVerdict::SkipRemapped: GuestUnifiedMemory::NoteFastSkip(GuestUnifiedMemory::FastSkip::TexelsChanged); break;
+                    case ResidentReuseVerdict::SkipBorrowed:
+                    case ResidentReuseVerdict::SkipForeignPending: GuestUnifiedMemory::NoteFastSkip(GuestUnifiedMemory::FastSkip::OtherPending); break;
+                    case ResidentReuseVerdict::SkipKeysUnproved: GuestUnifiedMemory::NoteFastSkip(GuestUnifiedMemory::FastSkip::KeysUnproved); break;
+                    case ResidentReuseVerdict::SkipKeysDiffer: GuestUnifiedMemory::NoteFastSkip(GuestUnifiedMemory::FastSkip::KeysDiffer); break;
+                    case ResidentReuseVerdict::AttemptProof:
+                    case ResidentReuseVerdict::Count: break;
+                }
+                if (verdict == ResidentReuseVerdict::SkipRemapped) untrackedRescueForeign.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                auto& memo = untrackedRescueMemo;
+                const bool memoHit = memo.valid && memo.epoch == epoch && memo.pendingSerial == serial && memo.forgetSerial == forget && memo.keys == fastKeys;
+                if (memoHit) {
+                    ++Profile().storageReused;
+                    GuestUnifiedMemory::NoteReuse(guestBytes);
+                    untrackedRescueHits.fetch_add(1, std::memory_order_relaxed);
+                    untrackedRescueMemoHits.fetch_add(1, std::memory_order_relaxed);
+                    if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshUnchanged, start);
+                    return true;
+                }
+                if (GuestMemory::CompareMapped(descriptor.baseAddress, std::span<const std::byte>(original)) == GuestMemory::Compare::Equal) {
+                    memo.valid = true;
+                    memo.epoch = epoch;
+                    memo.pendingSerial = serial;
+                    memo.forgetSerial = forget;
+                    memo.keys = fastKeys;
+                    ++Profile().storageReused;
+                    GuestUnifiedMemory::NoteReuse(guestBytes);
+                    untrackedRescueHits.fetch_add(1, std::memory_order_relaxed);
+                    if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshUnchanged, start);
+                    return true;
+                }
+                untrackedRescueCompareMiss.fetch_add(1, std::memory_order_relaxed);
+                CrashNotef_nid_no_patch("resident-skip", "image=0x%llx compare-miss", static_cast<unsigned long long>(descriptor.baseAddress));
+                GuestUnifiedMemory::NoteFastSkip(GuestUnifiedMemory::FastSkip::TexelsChanged);
+            }
+        } else if (!GuestMemory::UnchangedSince(descriptor.baseAddress, size, generation)) {
+            GuestUnifiedMemory::NoteFastSkip(GuestUnifiedMemory::FastSkip::TexelsChanged);
+        } else {
+            DccKeys fastKeys = DccKeys::Uncompressed;
+            bool keysProved = false;
+            if (descriptor.dccAddress == 0) {
+                fastKeys = DccKeys::Uncompressed;
+                keysProved = true;
+            } else if (keyProof.generation != 0) {
+                const std::size_t keyCount = DccKeyBytes(guestBytes);
+                if (keyCount != 0 && GuestMemory::UnchangedSince(descriptor.dccAddress, keyCount, keyProof.generation)) {
+                    fastKeys = keyProof.keys;
+                    keysProved = true;
+                } else {
+                    GuestUnifiedMemory::NoteFastSkip(GuestUnifiedMemory::FastSkip::KeysUnproved);
+                }
+            } else {
+                GuestUnifiedMemory::NoteFastSkip(GuestUnifiedMemory::FastSkip::KeysUnproved);
+            }
+            if (keysProved && fastKeys == uploadedKeys) {
+                // Self-exempt like overlappingPending: other pending results over
+                // this memory must still go through the slow path's FlushPending.
+                if (overlappingPending(descriptor.baseAddress, size).empty()) {
+                    ++Profile().storageReused;
+                    GuestUnifiedMemory::NoteReuse(guestBytes);
+                    if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshUnchanged, start);
+                    return true;
+                }
+                GuestUnifiedMemory::NoteFastSkip(GuestUnifiedMemory::FastSkip::OtherPending);
+            } else if (keysProved) {
+                GuestUnifiedMemory::NoteFastSkip(GuestUnifiedMemory::FastSkip::KeysDiffer);
+            }
+        }
+    }
     // Results of other images pending in this memory must reach it first, except an alias's: its
     // units are taken on the device below (borrowUnits), so it stays pending. The keys read for
     // that decision are read again after the flush, which may store keys itself. The exemption
@@ -1207,8 +1499,12 @@ bool StorageTexture::Refresh() {
     // generation, no results of this image's own there) or dead to its own write-back (tracked and
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
-    auto alias = pendingAlias();
-    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
+    std::shared_ptr<StorageTexture> alias;
+    {
+        RefreshPhaseClock clock(RefreshPhases().aliasUs, profile);
+        alias = pendingAlias();
+        if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
+    }
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
         if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) alias = nullptr;
@@ -1221,12 +1517,20 @@ bool StorageTexture::Refresh() {
         }
     }
     // No publish: the upload below reads the stored units from the unit shadow itself.
-    const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
+    bool flushed = false;
+    {
+        RefreshPhaseClock clock(RefreshPhases().flushUs, profile);
+        flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
+    }
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
     // since `generation` need no comparison.
-    const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    std::uint64_t current = 0;
+    {
+        RefreshPhaseClock clock(RefreshPhases().collectUs, profile);
+        current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    }
     // Per tracked layer: changed since its generation (a keys change makes every layer stale).
     std::vector<bool> changed(trackedLayers, false);
     // Per 64 KiB block of the surface (blockGenerations): stamped since its layer's generation, and
@@ -1244,6 +1548,7 @@ bool StorageTexture::Refresh() {
     bool direct = false;
     DccKeys keys = uploadedKeys;
     {
+        RefreshPhaseClock detectClock(RefreshPhases().detectUs, profile);
         const auto equalsOriginal = [&] {
             // Named for the [hooksync] attribution: the compare goes through the flush hook.
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
@@ -1256,7 +1561,10 @@ bool StorageTexture::Refresh() {
             tracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stampedBlocks, cpuBlocks);
         };
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        keys = ProvedKeys();
+        {
+            RefreshPhaseClock keysClock(RefreshPhases().keysUs, profile);
+            keys = ProvedKeys();
+        }
         if (profile && descriptor.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, keysStart);
         if (keys != uploadedKeys) {
             changed.assign(trackedLayers, true);
@@ -1302,6 +1610,78 @@ bool StorageTexture::Refresh() {
         if (!unchanged && !keysChanged && !pendingChanged && originalValid && equalsOriginal()) {
             unchanged = true;
             stamped = false;
+        } else if (!unchanged && !keysChanged && untrackedSnapshotValid && UntrackedSnapshotEnabled()) {
+            // Untracked-range rescue, for clean images and for pending
+            // results threatened only by dead stamps alike: the changed
+            // evidence is dead stamps rather than CPU writes (cpuWrote is
+            // false) or key changes, so byte equality against the snapshot
+            // proves the image current. Pending results stay on the GPU: no
+            // write-back, no re-upload. Tracked-pending layers, aliases, key
+            // changes and any unknown state keep the pre-existing path
+            // bit-for-bit.
+            //
+            // The byte-compare is skipped while the proof memo holds: same
+            // global collect epoch (no queue ordering point passed anywhere),
+            // same pending-registry serial, same mapping generation, same
+            // keys, plus a live pending-registry scan with no foreign
+            // results. Staleness matches the collect-epoch memo
+            // (GuestMemory.hpp): a guest write landing inside the epoch is
+            // seen by the next one, and any miss re-proves with a full
+            // compare, so a wrongly-kept verdict self-heals within one epoch.
+            // The memo needs no version: every content change path either
+            // preserves the proven invariant (an upload or clear establishes
+            // content that the rescue may keep) or moves a memo input
+            // (stores and flushes move the serial, remaps move the mapping
+            // generation, key flips change the keys).
+            bool untrackedOnly = true;
+            for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+                if (changed[layer] && layerGeneration[layer] != 0) {
+                    untrackedOnly = false;
+                    break;
+                }
+            }
+            const auto verdict = DecideUntrackedRescue(keysChanged, cpuWrote, untrackedOnly, alias != nullptr);
+            untrackedRescueSkips[static_cast<std::size_t>(verdict)].fetch_add(1, std::memory_order_relaxed);
+            if (verdict == UntrackedRescueVerdict::Rescue) {
+                const auto epoch = GuestMemory::CollectEpochBumps();
+                const auto serial = PendingSerial();
+                const auto forget = GuestMemory::ForgetSerial();
+                auto& memo = untrackedRescueMemo;
+                const bool memoHit = memo.valid && memo.epoch == epoch && memo.pendingSerial == serial && memo.forgetSerial == forget && memo.keys == keys;
+                // Remapped memory since the snapshot forbids the rescue,
+                // however the bytes compare: the snapshot is ground truth
+                // only under the mapping it was taken.
+                bool foreignPending = untrackedSnapshotForgetSerial != forget;
+                if (!foreignPending) {
+                    for (const auto& other : overlappingPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+                        if (other.get() != this) {
+                            foreignPending = true;
+                            break;
+                        }
+                    }
+                }
+                if (foreignPending) {
+                    untrackedRescueForeign.fetch_add(1, std::memory_order_relaxed);
+                } else if (memoHit) {
+                    unchanged = true;
+                    stamped = false;
+                    untrackedRescueHits.fetch_add(1, std::memory_order_relaxed);
+                    untrackedRescueMemoHits.fetch_add(1, std::memory_order_relaxed);
+                    GuestUnifiedMemory::NoteReuse(guestBytes);
+                } else if (GuestMemory::CompareMapped(descriptor.baseAddress, std::span<const std::byte>(original)) != GuestMemory::Compare::Equal) {
+                    untrackedRescueCompareMiss.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    unchanged = true;
+                    stamped = false;
+                    memo.valid = true;
+                    memo.epoch = epoch;
+                    memo.pendingSerial = serial;
+                    memo.forgetSerial = forget;
+                    memo.keys = keys;
+                    untrackedRescueHits.fetch_add(1, std::memory_order_relaxed);
+                    GuestUnifiedMemory::NoteReuse(guestBytes);
+                }
+            }
         }
         // Only the direct path uploads the selected layers alone (see upload); the others replace
         // the whole image, so every pending layer's results are stored first.
@@ -1330,6 +1710,7 @@ bool StorageTexture::Refresh() {
         }
     }
     if (unchanged) {
+        RefreshPhaseClock unchangedClock(RefreshPhases().unchangedUs, profile);
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
@@ -1337,6 +1718,7 @@ bool StorageTexture::Refresh() {
         return true;
     }
     CaptureTrace::Log("refresh image=%llx bytes=%llu generation=%llu dirty=%d keysChanged=%d cpuWrote=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), dirty, keysChanged, cpuWrote);
+    RefreshPhaseClock changedClock(RefreshPhases().changedUs, profile);
     // Debug aid: APS5_TRACE_UPLOAD names why a storage image is uploaded again.
     static const bool traceUpload = std::getenv("APS5_TRACE_UPLOAD") != nullptr;
     if (traceUpload) {
@@ -1412,14 +1794,20 @@ bool StorageTexture::Refresh() {
     }
     if (anyStored) {
         const auto previous = std::exchange(flushReason, "refresh");
-        writeBackLayers(stored);
+        {
+            RefreshPhaseClock storeClock(RefreshPhases().storeUs, profile);
+            writeBackLayers(stored);
+        }
         flushReason = previous;
     } else if (dropped) {
         reconcilePending();
     }
     if (anyBorrowed) {
         uploadReason = "alias";
-        borrowUnits(*alias, borrowed);
+        {
+            RefreshPhaseClock uploadClock(RefreshPhases().uploadUs, profile);
+            borrowUnits(*alias, borrowed);
+        }
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
             if (borrowed[unit]) layerGeneration[unit] = current;
         }
@@ -1427,7 +1815,30 @@ bool StorageTexture::Refresh() {
     }
     if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
-        upload(&changed);
+        {
+            RefreshPhaseClock uploadClock(RefreshPhases().uploadUs, profile);
+            if (uploadReason != nullptr && std::strcmp(uploadReason, "untracked") == 0) {
+                auto& phases = RefreshPhases();
+                phases.untrackedUploads.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard lock(phases.ringMutex);
+                std::size_t slot = phases.ringNext % 8;
+                bool known = false;
+                for (std::size_t i = 0; i < 8; ++i) {
+                    if (phases.ringAddr[i] == descriptor.baseAddress && phases.ringBytes[i] == guestBytes) {
+                        ++phases.ringCount[i];
+                        known = true;
+                        break;
+                    }
+                }
+                if (!known) {
+                    phases.ringAddr[slot] = descriptor.baseAddress;
+                    phases.ringBytes[slot] = guestBytes;
+                    phases.ringCount[slot] = 1;
+                    phases.ringNext = slot + 1;
+                }
+            }
+            upload(&changed);
+        }
     } else {
         uploadedKeys = keys;
     }
@@ -1478,6 +1889,13 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 }
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
+    // The image is (re)synced from these guest bytes: record whose allocation
+    // they belong to, so a later write-back can tell reuse apart (see ownerCurrent).
+    noteOwnerSynced();
+    // Flight recorder: uploads are the last big guest-memory reads before a
+    // death elsewhere (a game-side crash after a cutscene names no driver
+    // frame, so this is what places the driver at the scene).
+    CrashNotef_nid_no_patch("upload", "image=0x%llx bytes=%llu reason=%s", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), uploadReason != nullptr ? uploadReason : "?");
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1577,6 +1995,13 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             ++Profile().storageDirectUploads;
             ++version;
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
+            // Untracked-range snapshot for the Refresh rescue (see Refresh).
+            if (generation == 0 && UntrackedSnapshotEnabled()) {
+                GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+                untrackedSnapshotValid = true;
+                untrackedSnapshotForgetSerial = GuestMemory::ForgetSerial();
+                untrackedSnapshots.fetch_add(1, std::memory_order_relaxed);
+            }
             return;
         }
         // Units another image's results shadow reach the import before the detile reads it in place.
@@ -1650,12 +2075,30 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         ++Profile().storageDirectUploads;
         ++version;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
+        // Untracked-range snapshot for the Refresh rescue (see Refresh).
+        if (generation == 0 && UntrackedSnapshotEnabled()) {
+            GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+            untrackedSnapshotValid = true;
+            untrackedSnapshotForgetSerial = GuestMemory::ForgetSerial();
+            untrackedSnapshots.fetch_add(1, std::memory_order_relaxed);
+        }
         return;
     }
     originalValid = true;
     forgetBorrowed(0, trackedLayers);
     stampLayers(false);
     GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+    // Untracked-range snapshot for the Refresh rescue (see Refresh): the CPU
+    // path reads the same committed bytes the direct path snapshots above, so
+    // a write-watch-excluded surface synced here gets the same ground truth.
+    // `original` is compare-only in both paths (uploads always re-read), the
+    // rescue never uses it as an upload base, and the kill switch disables
+    // this together with everything else.
+    if (generation == 0 && UntrackedSnapshotEnabled()) {
+        untrackedSnapshotValid = true;
+        untrackedSnapshotForgetSerial = GuestMemory::ForgetSerial();
+        untrackedSnapshots.fetch_add(1, std::memory_order_relaxed);
+    }
     {
             Buffer staging(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (uploadedKeys == DccKeys::Uncompressed) std::memcpy(staging.Bytes().data(), original.data(), original.size());
@@ -3318,6 +3761,36 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     return bytes;
 }
 
+namespace {
+// The guest allocation covering [base, base + size), as (allocationAddress,
+// allocationBytes); {0, 0} when no single registered range covers the span.
+std::pair<std::uint64_t, std::size_t> CoveringOwner(std::uint64_t base, std::uint64_t size) {
+    if (size == 0 || size > std::numeric_limits<std::uint64_t>::max() - base) return {0, 0};
+    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    for (const auto& range : lease) {
+        if (range->bytes < size || range->address > base || base + size > range->address + range->bytes) continue;
+        if (!range->readable) continue;
+        return {range->allocationAddress, range->allocationBytes};
+    }
+    return {0, 0};
+}
+} // namespace
+
+void StorageTexture::noteOwnerSynced() {
+    const auto owner = CoveringOwner(descriptor.baseAddress, guestBytes);
+    ownerAllocBase = owner.first;
+    ownerAllocBytes = owner.second;
+}
+
+bool StorageTexture::ownerCurrent() const {
+    if (ownerAllocBytes == 0) return true; // no baseline recorded: nothing to compare against
+    const auto owner = CoveringOwner(descriptor.baseAddress, guestBytes);
+    return owner.first == ownerAllocBase && owner.second == ownerAllocBytes;
+}
+
+// Diagnostic counters for the owner guard below (see writeBackLayers).
+std::atomic<std::uint64_t> ownerUnknown{0}, ownerCheckedOk{0};
+
 void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
     // Block units are stored per access; an image whose units keep being asked for in pieces (a
     // consumer touching it through many small ranges, each piece re-arming the pending memos of
@@ -3375,6 +3848,30 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         StorageTexture& texture;
         ~Reconcile() { texture.reconcilePending(); }
     } reconcile{*this};
+    // The surface's memory may have been freed and re-registered under another
+    // allocation since the pending results were produced (freed texture memory
+    // reused for something else entirely, e.g. job data): storing stale texels
+    // over the new owner's live bytes corrupts it. The 64 KiB generation
+    // tracking cannot see a reuse with no CPU writes (a free-list pop reads
+    // the block before writing it), so the allocation identity is compared
+    // instead. Drops like the unregistered case below; APS5_NO_UNREGISTERED_DROP=1 stores.
+    static const bool unregisteredDrop = std::getenv("APS5_NO_UNREGISTERED_DROP") == nullptr;
+    if (ownerAllocBytes == 0) {
+        if (ownerUnknown.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] storage image 0x%llx+0x%llx: no owner baseline, write-back unchecked\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes));
+    } else if (ownerCheckedOk.fetch_add(1, std::memory_order_relaxed) % 4096 == 0) {
+        std::fprintf(stderr, "[gpu] owner guard: %llu write-backs checked ok, %llu unknown-baseline, %llu reuse-drops\n", static_cast<unsigned long long>(ownerCheckedOk.load(std::memory_order_relaxed)), static_cast<unsigned long long>(ownerUnknown.load(std::memory_order_relaxed)), static_cast<unsigned long long>(ownerReusedDropped.load(std::memory_order_relaxed)));
+    }
+    if (unregisteredDrop && !ownerCurrent()) {
+        static std::atomic<int> ownerReports{0};
+        if (ownerReports.fetch_add(1) < 4) {
+            const auto owner = CoveringOwner(descriptor.baseAddress, guestBytes);
+            std::fprintf(stderr, "[gpu] storage image 0x%llx+0x%llx: memory re-registered under another allocation (was 0x%llx+%zu, now 0x%llx+%zu); pending results dropped\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(ownerAllocBase), ownerAllocBytes, static_cast<unsigned long long>(owner.first), owner.second);
+        }
+        ownerReusedDropped.fetch_add(1, std::memory_order_relaxed);
+        originalValid = false;
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) layerPending[layer] = false;
+        return;
+    }
     const auto elementBytes = BytesPerElement(descriptor.format);
     // 64 KiB blocks the CPU wrote since the layer was last in sync keep the CPU's bytes: the game
     // may have reused the memory for something else entirely (see layerGeneration). A generation of
@@ -3435,6 +3932,13 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     if (traceKept && skippedAny) {
         const auto first = keep.empty() ? descriptor.baseAddress + guestBytes : keep.front().first;
         std::fprintf(stderr, "[flush] image 0x%llx+0x%llx keeps %zu CPU-written 64 KiB blocks (first stored byte at +0x%llx, %zu ranges stored, generation %llu)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), skipped, static_cast<unsigned long long>(first - descriptor.baseAddress), keep.size(), static_cast<unsigned long long>(generation));
+    }
+    // Flight recorder: write-backs are the driver writes into guest memory,
+    // so on a game-side heap crash these ranges are the first suspects.
+    {
+        const auto first = keep.empty() ? descriptor.baseAddress : keep.front().first;
+        const auto last = keep.empty() ? descriptor.baseAddress : keep.front().second;
+        CrashNotef_nid_no_patch("writeback", "image=0x%llx keep=%zu first=0x%llx+0x%llx kept-cpu=%zu reason=%s", static_cast<unsigned long long>(descriptor.baseAddress), keep.size(), static_cast<unsigned long long>(first), static_cast<unsigned long long>(last > first ? last - first : 0), skipped, flushReason != nullptr ? flushReason : "?");
     }
     // Taken before this write-back stamps anything (see advanceAdjacent), with the 64 KiB block span
     // its stamps cover.
@@ -3607,7 +4111,6 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // allocation: no readable registered range contains it) has nothing to receive its results;
     // the round trip through the CPU below would store stale texels over whatever the memory
     // holds now. Its selected units are dropped instead. APS5_NO_UNREGISTERED_DROP=1 stores.
-    static const bool unregisteredDrop = std::getenv("APS5_NO_UNREGISTERED_DROP") == nullptr;
     if (unregisteredDrop && !RegisteredReadableCovers(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx+0x%llx: memory no longer registered; %zu pending ranges dropped\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), keep.size());

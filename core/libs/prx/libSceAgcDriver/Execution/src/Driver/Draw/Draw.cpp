@@ -4,7 +4,10 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -135,7 +138,25 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto& program = programs[i];
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
         decodeReads[i].clear();
-        vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i]);
+        // Playable rule: the user-data SGPR pairs naming guest vertex tables
+        // may still be streaming (torn pairs read as garbage addresses).
+        // Leave this stage without embedded fetch info and reject the draw;
+        // later draws re-decode once streamed. The packet layer counts the
+        // rejection and continues the submission.
+        try {
+            vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i]);
+        } catch (const std::exception& error) {
+            static std::atomic<std::uint64_t> decodeSkips{0};
+            static std::atomic<std::uint64_t> decodeReported{0};
+            const auto total = decodeSkips.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (decodeReported.load(std::memory_order_relaxed) < 4) {
+                decodeReported.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr, "[gpu] rejected draw: vertex stage decode failed (%llu total): %s\n", static_cast<unsigned long long>(total), error.what());
+            }
+            vertexInfos[i].reset();
+            decodeReads[i].clear();
+            rejected = std::string("vertex stage decode: ") + error.what();
+        }
     };
     if (!registerKey) {
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
@@ -178,6 +199,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         phaseTiming.Phase(DrawRowDecode);
     }
+    // A failed vertex-stage decode above already recorded the reason: reject
+    // before touching programs whose fetch info is missing.
+    if (!rejected.empty()) return DrawVerdict::Rejected;
 
     static const bool indxOffsetSkipFold = std::getenv("APS5_INDX_OFFSET_SKIP_FOLD") != nullptr;
     static const bool indexedOffsetFold = std::getenv("APS5_NO_INDEXED_OFFSET_FOLD") == nullptr;

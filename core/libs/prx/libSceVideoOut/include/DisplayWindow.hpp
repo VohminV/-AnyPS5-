@@ -2,7 +2,6 @@
 #define CORE_LIBS_PRX_LIBSCEVIDEOOUT_INCLUDE_DISPLAYWINDOW_HPP
 
 #include <cstdint>
-#include <string>
 #include "SDL.h"
 
 inline constexpr std::uint32_t DisplayWindowMinimumWidth = 320;
@@ -22,11 +21,6 @@ public:
     void DrawableSize(std::uint32_t& width, std::uint32_t& height) const;
     void UpdateTitle();
     void ToggleFullscreen();
-    // Help line shown in the window title instead of the FPS counter while set.
-    void SetHelpText(std::string text);
-    bool ShowingHelp() const;
-    // Native message-box dialog with the full bindings description.
-    void ShowHelpDialog(const std::string& body);
 
 private:
     void create(std::uint32_t sourceWidth, std::uint32_t sourceHeight);
@@ -40,7 +34,6 @@ private:
     SDL_Window* window = nullptr;
     std::uint32_t aspectWidth = 0;
     std::uint32_t aspectHeight = 0;
-    std::string helpText;
 };
 
 #endif

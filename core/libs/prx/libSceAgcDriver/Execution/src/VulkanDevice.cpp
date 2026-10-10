@@ -32,10 +32,12 @@
 #include <chrono>
 #include <charconv>
 #include <condition_variable>
+#include <cstdio>
 #include <fstream>
 #include <cctype>
 #include <cstdlib>
 #include <mutex>
+#include <new>
 #include <SDL_loadso.h>
 #include <SDL_error.h>
 #include <spirv/unified1/spirv.hpp>
@@ -61,6 +63,21 @@ void check(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) {
         throw std::runtime_error(std::string(operation) + ": Vulkan result " + std::to_string(result));
     }
+}
+
+// Opt-in validation-layer diagnostics (APS5_VULKAN_VALIDATION=1). The layer is
+// enabled only when installed: requesting a missing layer would fail instance
+// creation. Messages go to stderr; verbose/info are skipped to keep game logs
+// readable. Off by default: validation serializes queue work and must never
+// ship in performance builds, and it checks Vulkan API use only (it says
+// nothing about the guest allocator or SPIR-V semantics).
+VKAPI_ATTR VkBool32 VKAPI_CALL ValidationMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT types, const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
+    const char* level = (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0 ? "error" : "warning";
+    const char* type = (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) != 0 ? "validation" : ((types & VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT) != 0 ? "performance" : "general");
+    const char* id = data != nullptr && data->pMessageIdName != nullptr ? data->pMessageIdName : "?";
+    const char* text = data != nullptr && data->pMessage != nullptr ? data->pMessage : "?";
+    std::fprintf(stderr, "[vulkan-validation] %s %s %s: %s\n", level, type, id, text);
+    return VK_FALSE;
 }
 
 void require(bool condition, const char* reason) {
@@ -171,6 +188,7 @@ struct VulkanDevice::State {
     VkCommandPool pool = VK_NULL_HANDLE;
     void* window = nullptr;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT validationMessenger = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D extent{};
     std::vector<VkImage> images;
@@ -570,6 +588,7 @@ struct VulkanDevice::State {
             destroyDevice(device, nullptr);
         }
         if (instance != VK_NULL_HANDLE) {
+            if (validationMessenger != VK_NULL_HANDLE) reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(instanceProc(instance, "vkDestroyDebugUtilsMessengerEXT"))(instance, validationMessenger, nullptr);
             if (surface) reinterpret_cast<PFN_vkDestroySurfaceKHR>(instanceProc(instance, "vkDestroySurfaceKHR"))(instance, surface, nullptr);
             reinterpret_cast<PFN_vkDestroyInstance>(instanceProc(instance, "vkDestroyInstance"))(instance, nullptr);
         }
@@ -622,8 +641,42 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
         create.ppEnabledExtensionNames = instanceExtensions.data();
     }
+    // See ValidationMessage: opt-in, only when the layer is installed.
+    std::vector<const char*> validationLayers;
+    if (std::getenv("APS5_VULKAN_VALIDATION") != nullptr) {
+        const auto enumerateLayers = state->InstanceFunction<PFN_vkEnumerateInstanceLayerProperties>("vkEnumerateInstanceLayerProperties");
+        std::uint32_t layerCount = 0;
+        check(enumerateLayers(&layerCount, nullptr), "vkEnumerateInstanceLayerProperties");
+        std::vector<VkLayerProperties> layers(layerCount);
+        check(enumerateLayers(&layerCount, layers.data()), "vkEnumerateInstanceLayerProperties");
+        const bool haveLayer = std::any_of(layers.begin(), layers.end(), [](const auto& item) { return std::strcmp(item.layerName, "VK_LAYER_KHRONOS_validation") == 0; });
+        const auto enumerateExtensions = state->InstanceFunction<PFN_vkEnumerateInstanceExtensionProperties>("vkEnumerateInstanceExtensionProperties");
+        std::uint32_t extensionCount = 0;
+        check(enumerateExtensions(nullptr, &extensionCount, nullptr), "vkEnumerateInstanceExtensionProperties");
+        std::vector<VkExtensionProperties> extensions(extensionCount);
+        check(enumerateExtensions(nullptr, &extensionCount, extensions.data()), "vkEnumerateInstanceExtensionProperties");
+        const bool haveDebugUtils = std::any_of(extensions.begin(), extensions.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; });
+        if (haveLayer && haveDebugUtils) {
+            instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            validationLayers.push_back("VK_LAYER_KHRONOS_validation");
+            create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
+            create.ppEnabledExtensionNames = instanceExtensions.data();
+            create.enabledLayerCount = static_cast<std::uint32_t>(validationLayers.size());
+            create.ppEnabledLayerNames = validationLayers.data();
+            APS5_LOG_OUT("Vulkan validation %s", "enabled (VK_LAYER_KHRONOS_validation + VK_EXT_debug_utils)");
+        } else {
+            APS5_LOG_OUT("Vulkan validation requested but unavailable (layer=%d debug_utils=%d); continuing without it", haveLayer ? 1 : 0, haveDebugUtils ? 1 : 0);
+        }
+    }
     check(state->InstanceFunction<PFN_vkCreateInstance>("vkCreateInstance")(&create, nullptr, &state->instance), "vkCreateInstance");
     APS5_LOG_OUT("Vulkan instance created instance=%p", reinterpret_cast<void*>(state->instance));
+    if (!validationLayers.empty()) {
+        VkDebugUtilsMessengerCreateInfoEXT messenger{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+        messenger.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        messenger.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+        messenger.pfnUserCallback = ValidationMessage;
+        check(state->InstanceFunction<PFN_vkCreateDebugUtilsMessengerEXT>("vkCreateDebugUtilsMessengerEXT")(state->instance, &messenger, nullptr, &state->validationMessenger), "vkCreateDebugUtilsMessengerEXT");
+    }
     if (window != nullptr) {
         state->surface = window->createSurface(window->context, state->instance);
         require(state->surface != VK_NULL_HANDLE, "window returned a null surface");
@@ -2050,32 +2103,70 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     std::shared_ptr<Graphics::StorageTexture> resident;
     VkFilter filter = VK_FILTER_LINEAR;
     bool convert = false;
+    // Playable rule: the resident-image shortcut reads guest state that can
+    // still be streaming at a scene/cutscene transition (garbage DCC keys, an
+    // invalid runtime descriptor, an unqueryable range). Losing one frame to
+    // the guest-memory upload path beats terminating; persistent offenders
+    // stay visible through the first-8 reports. Anything else still throws.
+    const auto presentGarbage = [](const std::exception& error) -> bool {
+        if (dynamic_cast<const std::bad_alloc*>(&error) != nullptr) return false;
+        const std::string reason = error.what();
+        for (const char* marker : {"cannot query guest memory", "null or misaligned address",
+                                   "runtime image descriptor is invalid", "not a depth view",
+                                   "register-clear DCC keys", "not modeled",
+                                   "DescriptorBindingBuilder::Populate",
+                                   "unnormalized guest sampler"}) {
+            if (reason.find(marker) != std::string::npos) return true;
+        }
+        return false;
+    };
     if (!NoResidentPresent()) {
-        bool pending = false;
-        resident = PresentableResident(graphicsContext(), buffer, filter, pending, convert);
-        if (resident != nullptr && buffer.dccAddress != 0 && !ResidentServesDisplay(*resident, buffer)) {
+        try {
+            bool pending = false;
+            resident = PresentableResident(graphicsContext(), buffer, filter, pending, convert);
+            if (resident != nullptr && buffer.dccAddress != 0 && !ResidentServesDisplay(*resident, buffer)) {
+                resident.reset();
+                convert = false;
+            }
+            if (!pending) {
+                ++notPending;
+            } else if (resident == nullptr) {
+                ++unsuitable;
+            } else {
+                // 64 KiB blocks the CPU wrote since the image last matched guest memory would be shown
+                // stale (the write-back keeps the CPU's bytes for them): Refresh merges them into the
+                // image first, as a sampled texture of the image would (see cachedTexture). The uncached
+                // walk: the collect memo is per worker packet, so on this thread a memoized answer could
+                // miss a CPU write that landed after a worker's walk of the same range.
+                GuestMemory::CollectWritesUncached(buffer.address, bytes);
+                if (!GuestMemory::UnchangedSince(buffer.address, bytes, resident->Generation()) || (buffer.dccAddress != 0 && ResidentKeysMoved(*resident))) {
+                    resident->Refresh();
+                    ++refreshedPresents;
+                }
+                ++residentPresents;
+            }
+        } catch (const std::exception& error) {
+            if (!presentGarbage(error)) throw;
+            static std::atomic<std::uint64_t> fallbackReports{0};
+            if (fallbackReports.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::fprintf(stderr, "[gpu] present through guest memory (%s)\n", error.what());
+            }
             resident.reset();
             convert = false;
-        }
-        if (!pending) {
-            ++notPending;
-        } else if (resident == nullptr) {
             ++unsuitable;
-        } else {
-            // 64 KiB blocks the CPU wrote since the image last matched guest memory would be shown
-            // stale (the write-back keeps the CPU's bytes for them): Refresh merges them into the
-            // image first, as a sampled texture of the image would (see cachedTexture). The uncached
-            // walk: the collect memo is per worker packet, so on this thread a memoized answer could
-            // miss a CPU write that landed after a worker's walk of the same range.
-            GuestMemory::CollectWritesUncached(buffer.address, bytes);
-            if (!GuestMemory::UnchangedSince(buffer.address, bytes, resident->Generation()) || (buffer.dccAddress != 0 && ResidentKeysMoved(*resident))) {
-                resident->Refresh();
-                ++refreshedPresents;
-            }
-            ++residentPresents;
         }
     }
-    const auto cleared = buffer.dccAddress != 0 && resident == nullptr ? CompressedClearPixel(buffer, bytes) : std::nullopt;
+    std::optional<std::array<std::byte, 4>> cleared;
+    try {
+        if (buffer.dccAddress != 0 && resident == nullptr) cleared = CompressedClearPixel(buffer, bytes);
+    } catch (const std::exception& error) {
+        if (!presentGarbage(error)) throw;
+        static std::atomic<std::uint64_t> clearReports{0};
+        if (clearReports.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::fprintf(stderr, "[gpu] present through guest memory (%s)\n", error.what());
+        }
+        cleared = std::nullopt;
+    }
     auto& dumps = Dumps();
     bool dumpFrame = false;
     if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
@@ -2099,7 +2190,21 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         const auto channel = [&](std::size_t index) { return static_cast<float>(std::to_integer<unsigned>((*cleared)[index])) / 255.0f; };
         uniform = {{channel(2), channel(1), channel(0), channel(3)}};
     }
-    if (!present(buffer.width, buffer.height, true, {}, cleared ? nullptr : &buffer, resident, filter, dumpFrame, convert, cleared ? &uniform : nullptr)) {
+    bool shown = false;
+    try {
+        shown = present(buffer.width, buffer.height, true, {}, cleared ? nullptr : &buffer, resident, filter, dumpFrame, convert, cleared ? &uniform : nullptr);
+    } catch (const std::exception& error) {
+        // Same rule: a transient display-buffer failure drops this frame
+        // instead of terminating the title.
+        if (!presentGarbage(error)) throw;
+        static std::atomic<std::uint64_t> dropReports{0};
+        if (dropReports.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::fprintf(stderr, "[gpu] present dropped a frame (%s)\n", error.what());
+        }
+        if (dumpFrame) --dumps.dumped;
+        return false;
+    }
+    if (!shown) {
         // A dropped frame (swapchain out of date) keeps the dump numbering contiguous.
         if (dumpFrame) --dumps.dumped;
         return false;

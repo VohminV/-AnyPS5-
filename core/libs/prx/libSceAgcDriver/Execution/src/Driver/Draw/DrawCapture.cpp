@@ -29,10 +29,26 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
     stageCapture.pushOffset = pushOffset;
-    const auto capture = [&] {
+    // Playable rule: the capture reads guest descriptors (streamed in during
+    // loads), and a garbage image descriptor must reject this draw, not kill
+    // the process. Later captures re-read the memory once streamed. Compile
+    // and device errors below stay fatal: only the guest-reading capture is
+    // tolerated here.
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    try {
         const SampledReadScope sampling(evidenceReads);
-        return shaderMemory.Capture(invocation);
-    }();
+        capture = shaderMemory.Capture(invocation);
+    } catch (const std::exception& error) {
+        static std::atomic<std::uint64_t> captureSkips{0};
+        static std::atomic<std::uint64_t> captureReported{0};
+        const auto total = captureSkips.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (captureReported.load(std::memory_order_relaxed) < 4) {
+            captureReported.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr, "[gpu] rejected draw: recompile capture failed (%llu total): %s\n", static_cast<unsigned long long>(total), error.what());
+        }
+        rejected = std::string("recompile capture: ") + error.what();
+        return ShaderRecompiler::RecompileResult{};
+    }
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     recompiled[i] = true;

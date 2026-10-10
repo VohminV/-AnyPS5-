@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libc/include/CrashNotes.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -91,9 +92,12 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                     timing.Mark("device_idle_wait");
                 }
                 submitted = presenting->PresentDisplayBuffer(*buffer);
+                // Flight recorder: frame cadence and the displayed surface at death.
+                CrashNotef_nid_no_patch("present", "buffer=0x%llx %ux%u submitted=%d", static_cast<unsigned long long>(buffer->address), buffer->width, buffer->height, submitted ? 1 : 0);
                 timing.Mark("present_display_buffer");
             } else {
                 submitted = presenting->PresentClear(window.width, window.height, opaque);
+                CrashNotef_nid_no_patch("present", "clear %ux%u submitted=%d", window.width, window.height, submitted ? 1 : 0);
                 timing.Mark("present_clear");
             }
             if (submitted && syncFlip) {

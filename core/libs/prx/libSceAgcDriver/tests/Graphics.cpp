@@ -2841,6 +2841,9 @@ int main() {
         RunTextureFormatTests();
         RunTextureTilingTests();
         RunGuestTextureResourceTests();
+        RunDepthSurfaceReuseTests();
+        RunUntrackedRescueTests();
+        RunResidentReuseTests();
         RunGuestSamplerResourceTests();
         mock = MockVulkan{};
         auto textureDetilerContext = mockContext();
