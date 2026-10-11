@@ -3,6 +3,7 @@
 #include <array>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <functional>
@@ -139,6 +140,18 @@ inline ProfileOutput& ProfileOutput_nid_no_patch() {
     static ProfileOutput output([](std::string_view text) {
         if (std::fwrite(text.data(), 1, text.size(), stderr) != text.size() || std::fflush(stderr) != 0)
             throw std::runtime_error("profile output write failed");
+        // File mirror for GUI runs (no console): APS5_LOG_FILE=<path> appends
+        // every batch (flushed, so pre-crash windows survive). One spot covers
+        // all [storage]/[refresh-phases]/[draws]/[streaming-lock] summaries.
+        static FILE* logFile = []() -> FILE* {
+            const char* path = std::getenv("APS5_LOG_FILE");
+            if (path == nullptr || path[0] == '\0') return nullptr;
+            return std::fopen(path, "ab");
+        }();
+        if (logFile != nullptr) {
+            std::fwrite(text.data(), 1, text.size(), logFile);
+            std::fflush(logFile);
+        }
     });
     return output;
 }
