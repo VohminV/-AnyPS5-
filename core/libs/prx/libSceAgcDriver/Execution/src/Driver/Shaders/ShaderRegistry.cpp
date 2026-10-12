@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <list>
 #include <stdexcept>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
@@ -484,6 +485,34 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / 4u);
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     PrepareWatchdog watch(address, "register", code);
+    // Unblock boot past shaders that stall preparation (e.g. a 55k-word program
+    // stuck in the swappc pre-pass): a listed address returns no entries — the same
+    // deferred path as an unresolvable swappc target, so the dispatch skips it with
+    // a report instead of hanging the boot. Opt-in only: APS5_SKIP_SHADERS is a
+    // comma/space-separated list of lowercase hex addresses (0x prefix optional),
+    // e.g. APS5_SKIP_SHADERS=8000083e00. Unset (default) changes nothing.
+    {
+        static const std::string skip = [] { const char* text = std::getenv("APS5_SKIP_SHADERS"); return text != nullptr ? std::string(text) : std::string(); }();
+        if (!skip.empty()) {
+            char id[32];
+            std::snprintf(id, sizeof(id), "%llx", static_cast<unsigned long long>(address));
+            bool listed = false;
+            std::size_t pos = 0;
+            while (pos <= skip.size() && !listed) {
+                while (pos < skip.size() && (skip[pos] == ',' || skip[pos] == ' ' || skip[pos] == ';' || skip[pos] == '\t')) pos++;
+                std::size_t end = pos;
+                while (end < skip.size() && skip[end] != ',' && skip[end] != ' ' && skip[end] != ';' && skip[end] != '\t') end++;
+                std::string token = skip.substr(pos, end - pos);
+                if (token.rfind("0x", 0) == 0 || token.rfind("0X", 0) == 0) token = token.substr(2);
+                listed = !token.empty() && token == id;
+                pos = end + 1u;
+            }
+            if (listed) {
+                APS5_LOG_ERR("Shader preparation skipped by APS5_SKIP_SHADERS: shader 0x%llx", static_cast<unsigned long long>(address));
+                return {};
+            }
+        }
+    }
     std::optional<ShaderRecompiler::ShaderComputeStageInfo> compute;
     std::optional<ShaderRecompiler::ShaderPixelStageInfo> pixel;
     std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertex;
@@ -542,9 +571,31 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
         return std::string("shader ") + where + ": " + what;
     };
     try {
+        // The swappc pre-pass runs before PrepareShader (which owns PrepareStageClock),
+        // so a stall here is silent: no stage line is printed at all. Mirror the same
+        // APS5_TRACE_SHADER_STAGES=1 heartbeat plus an unconditional slow summary.
+        static const bool prepassTrace = std::getenv("APS5_TRACE_SHADER_STAGES") != nullptr;
+        const auto prepassMark = [&](const char* stage) {
+            if (prepassTrace) {
+                std::fprintf(stderr, "[shader-stages] 0x%llx pre-%s start\n", static_cast<unsigned long long>(address), stage);
+                std::fflush(stderr);
+            }
+        };
+        const auto prepassBegin = std::chrono::steady_clock::now();
+        prepassMark("decode");
         const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+        prepassMark("buildCfg");
         auto graph = ShaderRecompiler::GraphBuilder{}.Build(decoded, &swappc);
+        prepassMark("structurize");
         ShaderRecompiler::Structurizer{}.Structurize(graph);
+        const double prepassMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prepassBegin).count();
+        if (prepassMs >= 10000.0) {
+            std::size_t preEdges = 0;
+            for (const auto& block : graph.blocks) preEdges += block.successors.size();
+            std::fprintf(stderr, "[shader-stages] 0x%llx pre-pass words=%zu blocks=%zu edges=%zu total=%.1fs (swappc analysis before PrepareShader)\n",
+                static_cast<unsigned long long>(address), code.size(), graph.blocks.size(), preEdges, prepassMs / 1000.0);
+            std::fflush(stderr);
+        }
         const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
         ShaderRecompiler::RecompileRequest request{{stage, address, code, snapshot.headerAddress, snapshot.header}, {wave, firstUser, userData, compute, pixel, vertex, memory, RegisteredFloatMode(snapshot)}, stage == Stage::Compute ? device.ComputeTarget(wave) : device.Target(), {0, 0, 0, 128}, graphics};
         if (graphics && graphics->mesh) request.layout.pushConstantSizeBytes = ShaderRecompiler::MeshDrawPushOffsetBytes;

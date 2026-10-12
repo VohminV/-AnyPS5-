@@ -4,7 +4,9 @@
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/ResourceTracker.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "Optimization/SrtWalker.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
@@ -1761,6 +1763,205 @@ void verifyFunctionLdsBound() {
     require(unsized == FunctionLdsDwordLimit, "function LDS: an access without a known width must keep the full array");
 }
 
+// GetUserData -> Phi -> ReadConstBuffer/LoadAddressU32 -> GetAddressResource ->
+// LoadAddressU32 -> GetImageResource: the indirect descriptor chain behind a divergent Phi.
+// Before the splitter extension only direct SGPR arithmetic was split, so dword 0 failed
+// as "not a valid runtime value". The splitter now duplicates the ImageRead per edge.
+void verifyIndirectDescriptorPhi() {
+    using namespace ShaderRecompiler;
+    const auto userOperand = [](IrProgram& program, std::uint32_t index) -> IrValue& {
+        auto& reg = program.CreateValue(IrOpcode::Void, IrType::ScalarReg);
+        reg.SetRegister({RegisterBank::UserData, index});
+        auto& read = program.CreateValue(IrOpcode::GetUserData, IrType::U32);
+        read.AddArgument(&reg);
+        return read;
+    };
+    const auto constant = [](IrProgram& program, std::uint32_t value) -> IrValue& {
+        auto& created = program.CreateValue(IrOpcode::Void, IrType::U32);
+        created.SetImmediateU32(value);
+        return created;
+    };
+    const auto memoryBits = [](std::uint32_t index, std::uint32_t pc) {
+        MemoryFlags flags{index, pc};
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &flags, sizeof(flags));
+        return bits;
+    };
+
+    // 1. Phi/address/descriptor basics through the public validator.
+    {
+        IrProgram program;
+        program.Resources().stage = IrShaderStage::Compute;
+        program.Resources().userDataBase = 0;
+        program.Resources().userDataCount = 64;
+        auto& block = program.CreateBlock();
+        program.SetEntryBlock(block);
+        program.BlockOrder().push_back(&block);
+        auto& user0 = userOperand(program, 0);
+        auto& user1 = userOperand(program, 1);
+        auto& ok = program.CreateValue(IrOpcode::IAdd32, IrType::U32);
+        ok.AddArgument(&user0);
+        auto& c4 = constant(program, 4u);
+        ok.AddArgument(&c4);
+        block.AppendInstruction(&user0);
+        block.AppendInstruction(&user1);
+        block.AppendInstruction(&ok);
+        SrtWalker walker;
+        require(walker.ValidateRuntimeValue(program.Resources(), &user0), "indirect Phi: GetUserData was rejected");
+        require(walker.ValidateRuntimeValue(program.Resources(), &ok), "indirect Phi: uniform address arithmetic was rejected");
+        auto& lane = program.CreateValue(IrOpcode::LaneId, IrType::U32);
+        block.AppendInstruction(&lane);
+        auto& bad = program.CreateValue(IrOpcode::IAdd32, IrType::U32);
+        bad.AddArgument(&user0);
+        bad.AddArgument(&lane);
+        block.AppendInstruction(&bad);
+        require(!walker.ValidateRuntimeValue(program.Resources(), &bad), "indirect Phi: a lane-dependent address was accepted");
+        auto& farReg = program.CreateValue(IrOpcode::Void, IrType::ScalarReg);
+        farReg.SetRegister({RegisterBank::UserData, 5000});
+        auto& farRead = program.CreateValue(IrOpcode::GetUserData, IrType::U32);
+        farRead.AddArgument(&farReg);
+        block.AppendInstruction(&farRead);
+        require(!walker.ValidateRuntimeValue(program.Resources(), &farRead), "indirect Phi: out-of-range user data was accepted");
+    }
+
+    // 2. Full tracker split: divergent Phi behind a memory indirection becomes two images.
+    const auto buildIndirect = [&](bool divergent) {
+        IrProgram program;
+        program.Resources().stage = IrShaderStage::Compute;
+        program.Resources().userDataBase = 0;
+        program.Resources().userDataCount = 64;
+        program.Resources().srtPlanComplete = true;
+        MemoryInfo scalar;
+        scalar.kind = ResourceKind::ScalarAddress;
+        scalar.dataBits = 32u;
+        scalar.dataDwords = 1u;
+        MemoryInfo image;
+        image.kind = ResourceKind::Image;
+        image.dataBits = 32u;
+        image.dataDwords = 4u;
+        image.imageDimension = RdnaImageDimension::Dim2D;
+        program.Resources().memoryInfo = {scalar, image};
+        auto& head = program.CreateBlock();
+        auto& left = program.CreateBlock();
+        auto& right = program.CreateBlock();
+        auto& merge = program.CreateBlock();
+        program.SetEntryBlock(head);
+        program.BlockOrder().push_back(&head);
+        program.BlockOrder().push_back(&left);
+        program.BlockOrder().push_back(&right);
+        program.BlockOrder().push_back(&merge);
+        head.AddBranch(&left);
+        head.AddBranch(&right);
+        left.AddBranch(&merge);
+        right.AddBranch(&merge);
+        auto& userLow = userOperand(program, 0);
+        auto& userHigh = userOperand(program, 1);
+        head.AppendInstruction(&userLow);
+        head.AppendInstruction(&userHigh);
+        auto& cLeft = constant(program, 0u);
+        auto& cRight = constant(program, divergent ? 0x100u : 0u);
+        auto& addrLeft = program.CreateValue(IrOpcode::IAdd32, IrType::U32);
+        addrLeft.AddArgument(&userLow);
+        addrLeft.AddArgument(&cLeft);
+        left.AppendInstruction(&addrLeft);
+        auto& addrRight = program.CreateValue(IrOpcode::IAdd32, IrType::U32);
+        addrRight.AddArgument(&userLow);
+        addrRight.AddArgument(&cRight);
+        right.AppendInstruction(&addrRight);
+        auto& phi = program.CreateValue(IrOpcode::Phi, IrType::U32);
+        merge.AppendInstruction(&phi);
+        phi.AddPhiOperand(&left, &addrLeft);
+        phi.AddPhiOperand(&right, &addrRight);
+        auto& address = program.CreateValue(IrOpcode::GetAddressResource, IrType::AddressResource);
+        address.AddArgument(&phi);
+        address.AddArgument(&userHigh);
+        merge.AppendInstruction(&address);
+        auto& zero = constant(program, 0u);
+        auto& active = program.CreateValue(IrOpcode::Void, IrType::Bool);
+        active.SetImmediateBool(true);
+        auto& dword = program.CreateValue(IrOpcode::LoadAddressU32, IrType::U32, memoryBits(0u, 0x78u));
+        dword.AddArgument(&address);
+        dword.AddArgument(&zero);
+        dword.AddArgument(&zero);
+        dword.AddArgument(&active);
+        merge.AppendInstruction(&dword);
+        std::array<IrValue*, 8> dwords{};
+        dwords.fill(&dword);
+        auto& handle = program.CreateValue(IrOpcode::GetImageResource, IrType::ImageResource);
+        for (auto* d : dwords) handle.AddArgument(d);
+        merge.AppendInstruction(&handle);
+        std::array<IrValue*, 13> comps{};
+        comps.fill(&zero);
+        auto& imageAddress = program.CreateValue(IrOpcode::MakeImageAddress, IrType::ImageAddress);
+        for (auto* c : comps) imageAddress.AddArgument(c);
+        merge.AppendInstruction(&imageAddress);
+        auto& read = program.CreateValue(IrOpcode::ImageRead, IrType::U32x4, memoryBits(1u, 0x80u));
+        read.AddArgument(&handle);
+        read.AddArgument(&imageAddress);
+        read.AddArgument(&active);
+        merge.AppendInstruction(&read);
+        auto& keep = program.CreateValue(IrOpcode::ReferenceU32, IrType::Void);
+        keep.AddArgument(&read);
+        merge.AppendInstruction(&keep);
+        return program;
+    };
+    {
+        IrProgram program = buildIndirect(false);
+        ResourceTracker{}.Track(program);
+        require(program.Resources().info.images.size() == 1u, "indirect Phi: an invariant Phi must keep one image");
+    }
+    {
+        IrProgram program = buildIndirect(true);
+        ResourceTracker{}.Track(program);
+        require(program.Resources().info.images.size() == 2u, "indirect Phi: a divergent Phi behind a load must split into two images");
+    }
+
+    // 3. A genuinely invalid descriptor must still fail, now with PC/type/chain/reason.
+    {
+        IrProgram program;
+        program.Resources().stage = IrShaderStage::Compute;
+        program.Resources().userDataBase = 0;
+        program.Resources().userDataCount = 64;
+        program.Resources().srtPlanComplete = true;
+        MemoryInfo image;
+        image.kind = ResourceKind::Image;
+        image.dataBits = 32u;
+        image.dataDwords = 4u;
+        image.imageDimension = RdnaImageDimension::Dim2D;
+        program.Resources().memoryInfo = {image};
+        auto& block = program.CreateBlock();
+        program.SetEntryBlock(block);
+        program.BlockOrder().push_back(&block);
+        auto& badFloat = program.CreateValue(IrOpcode::Void, IrType::F32);
+        badFloat.SetImmediateF32(1.0f);
+        auto& zero = constant(program, 0u);
+        auto& active = program.CreateValue(IrOpcode::Void, IrType::Bool);
+        active.SetImmediateBool(true);
+        auto& handle = program.CreateValue(IrOpcode::GetImageResource, IrType::ImageResource);
+        handle.AddArgument(&badFloat);
+        for (int i = 0; i < 7; i++) handle.AddArgument(&zero);
+        block.AppendInstruction(&handle);
+        auto& imageAddress = program.CreateValue(IrOpcode::MakeImageAddress, IrType::ImageAddress);
+        for (int i = 0; i < 13; i++) imageAddress.AddArgument(&zero);
+        block.AppendInstruction(&imageAddress);
+        auto& read = program.CreateValue(IrOpcode::ImageRead, IrType::U32x4, memoryBits(0u, 0x90u));
+        read.AddArgument(&handle);
+        read.AddArgument(&imageAddress);
+        read.AddArgument(&active);
+        block.AppendInstruction(&read);
+        expectFailure([&] { ResourceTracker{}.Track(program); }, "dword 0 is not a valid runtime value", "indirect Phi: mistyped dword was accepted");
+        try {
+            ResourceTracker{}.Track(program);
+            require(false, "indirect Phi: mistyped dword failure carried no diagnostics");
+        } catch (const std::runtime_error& error) {
+            const std::string what(error.what());
+            require(what.find("at pc 0x") != std::string::npos, "indirect Phi: failure has no PC");
+            require(what.find("chain:") != std::string::npos, "indirect Phi: failure has no value chain");
+            require(what.find("reason:") != std::string::npos, "indirect Phi: failure has no reason");
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         using namespace ShaderRecompiler;
@@ -1793,6 +1994,7 @@ int main(int argc, char** argv) {
         verifyTwoLaneUniformValues();
         verifyBdaReadFallbackFunctions();
         verifyFunctionLdsBound();
+        verifyIndirectDescriptorPhi();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
             0x07230203u, 0x00010000u, 0u, 5u, 0u,

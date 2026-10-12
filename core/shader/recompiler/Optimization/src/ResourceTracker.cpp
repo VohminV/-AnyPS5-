@@ -45,9 +45,9 @@ std::string formatHex32(std::uint32_t value) {
 std::string describeValueChain(const IrValue* value, std::uint32_t depth) {
     value = value->Resolve();
     if (value->HasImmediate()) {
-        return "Immediate";
+        return std::string(IrOpcodeName(value->Opcode())) + ":" + TypeToString(value->Type()) + "(imm)";
     }
-    std::string text = std::string(IrOpcodeName(value->Opcode()));
+    std::string text = std::string(IrOpcodeName(value->Opcode())) + ":" + TypeToString(value->Type());
     if (value->Opcode() == IrOpcode::LoadAddressU32 || value->Opcode() == IrOpcode::ReadConstBuffer) {
         text += "@pc=0x" + formatHex32(value->Flags<MemoryFlags>().pc);
     }
@@ -63,6 +63,22 @@ std::string describeValueChain(const IrValue* value, std::uint32_t depth) {
     }
     text += ")";
     return text;
+}
+
+bool chainContainsPhi(const IrValue* value, std::uint32_t depth) {
+    value = value->Resolve();
+    if (value->HasImmediate() || depth == 0u) {
+        return value->IsPhi();
+    }
+    if (value->IsPhi()) {
+        return true;
+    }
+    for (std::uint32_t index = 0; index < value->ArgumentCount(); index++) {
+        if (chainContainsPhi(value->Argument(index), depth - 1u)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::uint32_t possibleU32Bits(const IrValue* value) {
@@ -487,6 +503,25 @@ private:
         }
     }
 
+    // Indirect descriptor chains (GetUserData -> Phi -> ReadConstBuffer/LoadAddressU32 ->
+    // GetAddressResource -> LoadAddressU32 -> GetImageResource) carry the Phi behind a pure
+    // memory indirection. The splitter must look through those pure constructors/loads;
+    // otherwise only direct SGPR arithmetic is split and the validator keeps rejecting
+    // dword 0 as non-invariant (upstream shadPS4 #2767: structurizer merges a logically
+    // unreachable edge, SSA then forms a divergent Phi).
+    static bool IsSplittableChainOp(IrOpcode op) {
+        if (Detail::IsRuntimeUniformOp(op)) {
+            return true;
+        }
+        switch (op) {
+            case IrOpcode::GetAddressResource:
+            case IrOpcode::GetBufferResource:
+            case IrOpcode::LoadAddressU32:
+            case IrOpcode::ReadConstBuffer: return true;
+            default: return false;
+        }
+    }
+
     void CollectDescriptorPhis(IrValue* value, std::vector<IrValue*>& phis, std::uint32_t depth) const {
         value = value->Resolve();
         if (value->HasImmediate()) {
@@ -498,7 +533,7 @@ private:
             }
             return;
         }
-        if (depth == 0u || !Detail::IsRuntimeUniformOp(value->Opcode())) {
+        if (depth == 0u || !IsSplittableChainOp(value->Opcode())) {
             return;
         }
         for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
@@ -544,7 +579,27 @@ private:
         const bool register_ = op == IrOpcode::GetUserData;
         const bool argumentless = (op == IrOpcode::GetShaderBase || op == IrOpcode::GetSrtResource) && value->ArgumentCount() == 0u;
         const bool srtRead = op == IrOpcode::ReadConst && value->ArgumentCount() == 2u && value->Argument(0)->Resolve()->Opcode() == IrOpcode::GetSrtResource && value->Argument(1)->Resolve()->HasImmediate();
-        if (!register_ && !argumentless && !srtRead && !Detail::IsRuntimeUniformOp(op)) {
+        // Pure address-chain nodes are safe to duplicate per control-flow edge (loads have no
+        // side effects; handles are value constructors). This mirrors CollectDescriptorPhis:
+        // without it SubstituteEdge bails on the first LoadAddressU32/ReadConstBuffer and the
+        // whole indirect Phi is left for the validator to reject.
+        // Restriction: memory loads are only rematerialized when their offset is an immediate.
+        // A dynamic (non-immediate) uniform offset has no SRT slot and would need descriptor DMA;
+        // splitting it would turn a planning-time rejection ("an edge without an SRT slot") into
+        // a late materialization failure. Immediate offsets stay plannable per edge.
+        const bool addressHandle = op == IrOpcode::GetAddressResource || op == IrOpcode::GetBufferResource;
+        bool addressLoad = op == IrOpcode::LoadAddressU32 || op == IrOpcode::ReadConstBuffer;
+        if (addressLoad) {
+            if (value->ArgumentCount() < 2u) {
+                return nullptr;
+            }
+            const IrValue* offset = value->Argument(1)->Resolve();
+            if (!offset->HasImmediate() || offset->Type() != IrType::U32) {
+                return nullptr;
+            }
+        }
+        const bool addressChain = addressHandle || addressLoad;
+        if (!register_ && !argumentless && !srtRead && !addressChain && !Detail::IsRuntimeUniformOp(op)) {
             return nullptr;
         }
         std::vector<IrValue*> arguments;
@@ -768,10 +823,10 @@ private:
         }
     }
 
-    void GetHandle(IrValue* value, IrOpcode expected, std::uint32_t width, IrValue*& handle, std::uint32_t& source, bool sampler = false, bool sampleAdjust = false) {
+    void GetHandle(IrValue* value, IrOpcode expected, std::uint32_t width, IrValue*& handle, std::uint32_t& source, std::uint32_t usePc, bool sampler = false, bool sampleAdjust = false) {
         handle = value->Resolve();
         if (handle->Opcode() != expected) {
-            fail("memory operation requires " + std::string(IrOpcodeName(expected)));
+            fail("memory operation requires " + std::string(IrOpcodeName(expected)) + " at pc 0x" + formatHex32(usePc));
         }
         DescriptorSource descriptor;
         MakeSource(*handle, width, sampler, sampleAdjust, descriptor);
@@ -784,13 +839,30 @@ private:
                     // plan (TryMakeTableImage); a direct descriptor here means the table
                     // pattern did not match. Keep rejecting (no dummy texture) but name
                     // the recovery knob for the next log.
-                    fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u) + " (scalar-loaded image descriptor without a bindless table; rerun with APS5_TRACE_BINDLESS=1 for the materializer reason)");
+                    fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value at pc 0x" + formatHex32(usePc) + "; type " + TypeToString(value2->Type()) + "; chain: " + describeValueChain(descriptor.dwords[badDword], 8u) + " (scalar-loaded image descriptor without a bindless table; rerun with APS5_TRACE_BINDLESS=1 for the materializer reason)");
                 }
             }
             badDword = 0;
         }
         if (!ValidateSource(descriptor, badDword)) {
-            fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
+            const IrValue* bad = descriptor.dwords[badDword]->Resolve();
+            // Reason, not just the chain: type mismatch vs divergent Phi vs other.
+            // Phi is the common indirect case (GetUserData -> Phi -> ReadConstBuffer /
+            // LoadAddressU32 -> GetAddressResource -> LoadAddressU32 -> GetImageResource):
+            // ResolveInvariantPhi == nullptr means control-flow inputs differ, so no single
+            // wave-uniform dword exists to bind.
+            std::string reason;
+            if (bad->Type() != IrType::U32) {
+                reason = "expected U32 dword, got " + TypeToString(bad->Type());
+            } else if (chainContainsPhi(descriptor.dwords[badDword], 8u)) {
+                reason = "divergent Phi in the address/descriptor chain (non-invariant control-flow inputs; "
+                         "the splitter covers direct and indirect (load/handle) chains, otherwise the shader needs a bindless table or a uniform address)";
+            } else if (bad->Opcode() == IrOpcode::LoadAddressU32 || bad->Opcode() == IrOpcode::ReadConstBuffer) {
+                reason = "memory-backed dword whose base/offset chain is not wave-uniform (raw-read kind, handle, or offset mismatch)";
+            } else {
+                reason = "non-uniform computation (not GetUserData/GetShaderBase/SRT/uniform arithmetic)";
+            }
+            fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value at pc 0x" + formatHex32(usePc) + "; type " + TypeToString(bad->Type()) + "; chain: " + describeValueChain(descriptor.dwords[badDword], 8u) + "; reason: " + reason);
         }
         source = InternSource(descriptor);
     }
@@ -1044,7 +1116,7 @@ private:
         if (indirect != nullptr) {
             source = indirect->source;
         } else {
-            GetHandle(inst.Argument(0), IrOpcode::GetImageResource, 8, handle, source);
+            GetHandle(inst.Argument(0), IrOpcode::GetImageResource, 8, handle, source, flags.pc);
         }
         resource = AddImage(source, memory, op, flags.pc);
         if (resource == std::numeric_limits<std::uint32_t>::max()) {
@@ -1059,7 +1131,7 @@ private:
             IrValue* samplerHandle = nullptr;
             std::uint32_t samplerSource = 0;
             const bool sampleAdjust = (memory.imageSampleFlags & RdnaImageSampleFlagAdjust) != 0;
-            GetHandle(inst.Argument(1), IrOpcode::GetSamplerResource, 4, samplerHandle, samplerSource, true, sampleAdjust);
+            GetHandle(inst.Argument(1), IrOpcode::GetSamplerResource, 4, samplerHandle, samplerSource, flags.pc, true, sampleAdjust);
             sampler = AddSampler(samplerSource, flags.pc);
             if (sampler == std::numeric_limits<std::uint32_t>::max()) {
                 fail("sampler resource limit exceeded");

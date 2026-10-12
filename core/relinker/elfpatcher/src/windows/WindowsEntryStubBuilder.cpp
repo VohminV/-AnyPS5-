@@ -134,7 +134,19 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     const auto newline = addString("\n");
     const auto searched = addString("Searched libraries:\n");
     const auto indent = addString("  ");
-    const auto enteringElf = addString("Transferring control to ELF entry point\n");
+    // Runtime stage diagnostics (stdout, same channel as the other startup
+    // prints): APP_START fires at stub entry; GAME_LOADER covers the
+    // LoadLibrary/GetProcAddress/guest-init sequence below; ARGUMENTS_PARSED
+    // fires once the argv block is built; GAME_EXECUTION hands control to the
+    // original ELF entry point. There is intentionally no GUEST_CPU_INIT line:
+    // guest code runs natively (no emulator/CPU-init step exists; TLS and
+    // relocations are applied by the OS loader, init_array by GAME_LOADER).
+    // VULKAN_INIT is reported by libSceAgcDriver itself (VulkanDevice
+    // constructor: "Vulkan instance created", "Physical device candidate=").
+    const auto appStart = addString("APP_START\n");
+    const auto guestInitDone = addString("GAME_LOADER: guest modules initialized\n");
+    const auto argumentsParsed = addString("ARGUMENTS_PARSED\n");
+    const auto enteringElf = addString("GAME_EXECUTION: Transferring control to ELF entry point\n");
     std::vector<std::uint32_t> resolvedPaths;
     for (std::size_t index = 0; index < libraries.size(); ++index)
         resolvedPaths.push_back(reserve(PathCapacity));
@@ -247,6 +259,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     };
 
     code.Emit({0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x48, 0x83, 0xec, 0x60});
+    writeString(appStart);
     code.Emit({0x31, 0xc9});
     code.Rip({0x48, 0x8d, 0x15}, programPath);
     code.Emit({0x41, 0xb8});
@@ -376,7 +389,7 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     }
 
     guestStartup.Initialize(code, guestModules, handles);
-    writeString(enteringElf);
+    writeString(guestInitDone);
     code.Rip({0x48, 0x8d, 0x0d}, shellLibrary);
     code.Emit({0x31, 0xd2, 0x41, 0xb8, 0, 8, 0, 0});
     call("LoadLibraryExA");
@@ -424,6 +437,8 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
     call("LocalFree");
     code.Rip({0x48, 0x8b, 0x0d}, shellHandle);
     call("FreeLibrary");
+    writeString(argumentsParsed);
+    writeString(enteringElf);
     code.Rip({0x48, 0x8b, 0x3d}, argumentBlock);
     const auto exitCallback = code.Branch({0x48, 0x8d, 0x35});
     code.Rip({0xe8}, entryRva);
