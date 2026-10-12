@@ -92,6 +92,22 @@ void CheckMix(const std::string& name, const std::array<std::uint32_t, 2>& words
 
 }
 
+void CheckUnknownVop2Diagnostic() {
+    // 0x00 is not in the VOP2 table: the decoder must keep the historical prefix
+    // and name the numeric encoding plus the program counter for the next game log.
+    const std::array<std::uint32_t, 1> words{(0x00u << 25u) | (0u << 17u) | (0u << 9u) | 1u};
+    try {
+        static_cast<void>(DecodeRdnaVectorOp(std::span<const std::uint32_t>(words), 0u));
+    } catch (const std::exception& error) {
+        const std::string what = error.what();
+        Require(what.find("VOP2 opcode is not implemented") != std::string::npos, "unknown VOP2 loses its family prefix: " + what);
+        Require(what.find("encoding 0x0") != std::string::npos, "unknown VOP2 hides its encoding: " + what);
+        Require(what.find("program counter") != std::string::npos, "unknown VOP2 hides its address: " + what);
+        return;
+    }
+    Require(false, "unknown VOP2 encoding 0x00 did not throw");
+}
+
 int main() {
     try {
         const std::array<Term, 3> accumulate{Register(Source0), Register(Source1), Register(Destination)};
@@ -105,6 +121,7 @@ int main() {
         Check("v_fmaak_f32", 0x2du, 2u, RdnaOpcode::VMadakF32, IrOpcode::FPFma32, addLiteral);
         CheckMix("v_fma_mix_f32", {0xcc200005u, 0x04220f06u});
         CheckMix("v_fma_mix_f32 op_sel_hi:[1,0,1]", {0xcc204005u, 0x0c220f06u});
+        CheckUnknownVop2Diagnostic();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

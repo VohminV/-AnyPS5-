@@ -624,7 +624,12 @@ template <typename TEntry, std::size_t Size>
 RdnaOpcode lookupVectorOpcode(const TEntry (&table)[Size], std::uint32_t encoding, const char* notSupportedReason) {
     const auto* entry = findVectorOpcodeEntry(table, encoding);
     if (entry == nullptr) {
-        throw std::invalid_argument(notSupportedReason);
+        // Keep the historical prefix (tests match on it) and append the numeric
+        // encoding so the next game log names the exact missing opcode instead of
+        // only the family. No semantic change for supported encodings.
+        char detail[128];
+        std::snprintf(detail, sizeof(detail), "%s (encoding 0x%x)", notSupportedReason, encoding);
+        throw std::invalid_argument(detail);
     }
     return entry->opcode;
 }
@@ -2194,7 +2199,16 @@ RdnaInstruction DecodeRdnaVop2(std::uint32_t programCounter, std::span<const std
     instruction.programCounter = programCounter;
     instruction.family = RdnaInstructionFamily::VOP2;
     instruction.opcodeId = opcode;
-    instruction.op = lookupVectorOpcode(vop2Opcodes, opcode, "VOP2 opcode is not implemented");
+    try {
+        instruction.op = lookupVectorOpcode(vop2Opcodes, opcode, "VOP2 opcode is not implemented");
+    } catch (const std::invalid_argument& error) {
+        // The shader-level log already prefixes the shader address; add the
+        // instruction address and raw word so the next log identifies the exact
+        // instruction without a binary dump.
+        char detail[192];
+        std::snprintf(detail, sizeof(detail), "%s at program counter 0x%08x (word 0x%08x, vdst %u src0 %u vsrc1 %u)", error.what(), programCounter, word, vdst, src0, vsrc1);
+        throw std::invalid_argument(detail);
+    }
     SetRdnaRawWords(instruction, code, wordIndex, 1);
 
     if (src0 == 249u) {

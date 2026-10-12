@@ -491,11 +491,31 @@ std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const Swa
         }
         const bool positional = std::all_of(program.instructions.begin(), program.instructions.begin() + index, isFetchCallPrefixOpcode);
         const std::uint32_t targetRegister = scalarIndex(instruction.source0);
+        // The call itself writes its link pair on execution, but the target is read
+        // before that write; counting the call as a "writer" of its own target pair
+        // makes this predicate identically false whenever link == target (the
+        // s_swappc_b64 s[N], s[N] swap-call shape), so the scan skips the call.
+        // This matches the return-pairing loop below, which also skips callIndex.
+        bool targetWritten = false;
+        std::string targetWriters;
+        for (std::uint32_t other = 0; other < program.instructions.size() && targetRegister != NoScalarRegister; ++other) {
+            if (other == index) {
+                continue;
+            }
+            const auto& writer = program.instructions[other];
+            if (writesScalar(writer, targetRegister) || writesScalar(writer, targetRegister + 1u)) {
+                targetWritten = true;
+                if (targetWriters.size() < 48u) {
+                    if (!targetWriters.empty()) {
+                        targetWriters += ",";
+                    }
+                    targetWriters += toHexString(writer.programCounter);
+                }
+            }
+        }
         const bool userDataPair = swappc != nullptr && targetRegister != NoScalarRegister &&
             targetRegister >= swappc->userDataBaseRegister && targetRegister + 1u < swappc->userDataBaseRegister + swappc->userDataCount &&
-            std::none_of(program.instructions.begin(), program.instructions.end(), [&](const RdnaInstruction& other) {
-                return writesScalar(other, targetRegister) || writesScalar(other, targetRegister + 1u);
-            });
+            !targetWritten;
         const bool outsideProgram = staticTarget && call.targetIndex == InvalidControlFlowId;
         if (instruction.op == RdnaOpcode::SSwappcB64 && swappc != nullptr && swappc->fetchCallAllowed && positional && (userDataPair || outsideProgram)) {
             call.fetch = true;
@@ -504,7 +524,24 @@ std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const Swa
             continue;
         }
         if (!staticTarget || call.targetIndex == InvalidControlFlowId) {
-            throw std::invalid_argument("computed/data-dependent s_swappc_b64 call target at program counter " + toHexString(instruction.programCounter) + " is not statically resolvable");
+            // Keep the historical prefix (tests/log parsers match on it) and append
+            // the link/target registers plus the fetch-call eligibility breakdown so
+            // the next log shows why this call was not statically resolved.
+            // Honesty rule: s_swappc_b64 carries no immediate target (branchTarget is
+            // unset for register-indirect calls), so no decoded address is printed;
+            // the computed address is unknown to this analysis.
+            std::string detail = "computed/data-dependent s_swappc_b64 call target at program counter " + toHexString(instruction.programCounter) + " is not statically resolvable";
+            detail += " (link s[" + std::to_string(call.linkRegister) + "]";
+            detail += targetRegister == NoScalarRegister ? ", target <non-scalar>" : ", target s[" + std::to_string(targetRegister) + ":s[" + std::to_string(targetRegister + 1u) + "]";
+            detail += ", decoded=register-indirect (no immediate), computed=unknown";
+            if (!program.instructions.empty()) {
+                detail += ", range=[" + toHexString(program.instructions.front().programCounter) + "," + toHexString(instructionEndProgramCounter(program.instructions.back())) + ")";
+            }
+            detail += targetRegister == NoScalarRegister ? ", origin=n/a" : (targetWritten ? ", origin=written@" + targetWriters : ", origin=uniform-input (never written in-program)");
+            detail += swappc == nullptr ? ", no swappc info" : (std::string(", fetchAllowed=") + (swappc->fetchCallAllowed ? "1" : "0") + " userBase=" + std::to_string(swappc->userDataBaseRegister) + " userCount=" + std::to_string(swappc->userDataCount));
+            detail += std::string(", positional=") + (positional ? "1" : "0") + ", userDataPair=" + (userDataPair ? "1" : "0") + ", outsideProgram=" + (outsideProgram ? "1" : "0");
+            detail += ", reason=no s_getpc+s_add/s_sub pattern in the 1..3-instruction window; fetch call additionally requires fetchAllowed=1, positional=1 and (userDataPair=1 or outsideProgram=1))";
+            throw std::invalid_argument(detail);
         }
         call.targetProgramCounter = target;
         calls.push_back(call);

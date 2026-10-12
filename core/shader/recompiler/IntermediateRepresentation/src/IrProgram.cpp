@@ -108,7 +108,16 @@ bool sameValue(const IrValue* left, const IrValue* right) {
     return false;
 }
 
-bool equivalentValueImpl(const IrResourcePlan& program, const IrValue* left, const IrValue* right, std::vector<std::pair<const IrValue*, const IrValue*>>& visited) {
+struct PairHash {
+    std::size_t operator()(const std::pair<const IrValue*, const IrValue*>& pair) const noexcept {
+        // Pointer-combining hash for equivalence memoization; order matters.
+        auto hash = std::hash<const IrValue*>{}(pair.first);
+        hash ^= std::hash<const IrValue*>{}(pair.second) + 0x9e3779b9u + (hash << 6u) + (hash >> 2u);
+        return hash;
+    }
+};
+
+bool equivalentValueImpl(const IrResourcePlan& program, const IrValue* left, const IrValue* right, std::unordered_set<std::pair<const IrValue*, const IrValue*>, PairHash>& visited) {
     if (left != nullptr) {
         left = left->Resolve();
     }
@@ -131,10 +140,9 @@ bool equivalentValueImpl(const IrResourcePlan& program, const IrValue* left, con
         return false;
     }
     const auto entry = std::make_pair(left, right);
-    if (std::find(visited.begin(), visited.end(), entry) != visited.end()) {
+    if (!visited.insert(entry).second) {
         return true;
     }
-    visited.push_back(entry);
     if (isRuntimeRead(left->Opcode())) {
         const auto leftIndex = left->Flags<MemoryFlags>().index;
         const auto rightIndex = right->Flags<MemoryFlags>().index;
@@ -743,7 +751,7 @@ void ResolveControlFlowIdentities(IrProgram& program) {
 }
 
 bool EquivalentValue(const IrResourcePlan& program, const IrValue* left, const IrValue* right) {
-    std::vector<std::pair<const IrValue*, const IrValue*>> visited;
+    std::unordered_set<std::pair<const IrValue*, const IrValue*>, PairHash> visited;
     return equivalentValueImpl(program, left, right, visited);
 }
 

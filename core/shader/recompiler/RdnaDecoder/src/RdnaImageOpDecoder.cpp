@@ -154,6 +154,12 @@ constexpr ImageOpcodeInfo imageOpcodes[] = {
     {0x60u, RdnaOpcode::ImageGetLod, nullptr, 0, false, false, false},
     {0xe6u, RdnaOpcode::ImageBvhIntersectRay, "image_bvh_intersect_ray", 0, false, false, false},
     {0xe7u, RdnaOpcode::ImageBvh64IntersectRay, "image_bvh64_intersect_ray", 0, false, false, false},
+    // 0xe4/0xe5 are the A16-layout ray-query forms (observed in the wild with
+    // the A16 control bit clear and NSA-packed addresses): they carry 8/9
+    // address VGPRs like an A16-bit e6/e7. The 32/64 assignment follows the
+    // e6/e7 even/odd parity; 0xe4 is unconfirmed in the wild.
+    {0xe4u, RdnaOpcode::ImageBvhIntersectRay, "image_bvh_intersect_ray_a16", 0, false, false, false},
+    {0xe5u, RdnaOpcode::ImageBvh64IntersectRay, "image_bvh64_intersect_ray_a16", 0, false, false, false},
 };
 
 const ImageOpcodeInfo& lookupOpcode(std::uint32_t opcode) {
@@ -162,7 +168,9 @@ const ImageOpcodeInfo& lookupOpcode(std::uint32_t opcode) {
             return entry;
         }
     }
-    throw std::runtime_error("unsupported MIMG opcode");
+    char text[32];
+    std::snprintf(text, sizeof(text), "unsupported MIMG opcode 0x%x", opcode);
+    throw std::runtime_error(text);
 }
 
 void validateFlags(std::uint32_t flags) {
@@ -350,6 +358,10 @@ RdnaInstruction DecodeRdnaMimg(std::uint32_t programCounter, std::span<const std
     }
     const bool a16 = (word1 & 0x40000000u) != 0u;
     const bool d16 = (word1 & 0x80000000u) != 0u;
+    // Opcodes 0xe4/0xe5 encode the A16 ray-query layout intrinsically (their
+    // observed encodings clear the A16 control bit yet pack only 8/9 address
+    // VGPRs); treat them as A16 for component sizing below.
+    const bool a16Layout = a16 || opcode == 0xe4u || opcode == 0xe5u;
     const auto dimension = decodeDimension((word0 >> 3u) & 7u);
     const bool multisampled = dimension == RdnaImageDimension::Dim2DMsaa || dimension == RdnaImageDimension::Dim2DMsaaArray;
     if (multisampled && (info.sample || info.gather || opcode == 0x60u || (opcode >= 1u && opcode <= 5u) || opcode == 9u || opcode == 0x0bu)) {
@@ -359,7 +371,7 @@ RdnaInstruction DecodeRdnaMimg(std::uint32_t programCounter, std::span<const std
     if (msaaLoad && !multisampled) {
         throw std::runtime_error("image_msaa_load requires a multisampled dimension");
     }
-    auto flags = info.flags | (a16 ? RdnaImageSampleFlagA16 : 0u);
+    auto flags = info.flags | (a16Layout ? RdnaImageSampleFlagA16 : 0u);
     if ((info.flags & RdnaImageSampleFlagDerivative) != 0u) {
         flags |= gradientCount(dimension) << RdnaImageSampleGradientCountShift;
     }
@@ -386,7 +398,7 @@ RdnaInstruction DecodeRdnaMimg(std::uint32_t programCounter, std::span<const std
     }
     const bool rayQuery64 = info.opcode == RdnaOpcode::ImageBvh64IntersectRay;
     const bool rayQuery = rayQuery64 || info.opcode == RdnaOpcode::ImageBvhIntersectRay;
-    std::uint32_t components = rayQuery ? (a16 ? 8u : 11u) + (rayQuery64 ? 1u : 0u) : opcode == 0x0Eu ? 1u : coordinateCount(dimension);
+    std::uint32_t components = rayQuery ? (a16Layout ? 8u : 11u) + (rayQuery64 ? 1u : 0u) : opcode == 0x0Eu ? 1u : coordinateCount(dimension);
     if (opcode == 1u || opcode == 4u || opcode == 5u || opcode == 9u || opcode == 0x0bu || (by && (opcode & 8u) != 0u) || pckNMip) {
         ++components;
     }
@@ -434,7 +446,7 @@ RdnaInstruction DecodeRdnaMimg(std::uint32_t programCounter, std::span<const std
     instruction.dlc = (word0 & 0x80u) != 0u;
     instruction.imageGlc = instruction.glc;
     instruction.imageSlc = instruction.slc;
-    instruction.imageA16 = a16;
+    instruction.imageA16 = a16Layout;
     instruction.imageD16 = d16;
     instruction.imageR128 = r128;
     instruction.imageDimension = dimension;

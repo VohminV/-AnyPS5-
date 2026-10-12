@@ -105,7 +105,7 @@ int APS5_VABI sceSysmoduleIsLoaded(std::uint16_t id) {
         throw std::runtime_error("sceSysmoduleIsLoaded: invalid id 0");
     }
     if (!findModuleName(id)) {
-        APS5_LOG_OUT("unknown id: %u", static_cast<unsigned>(id));
+        APS5_LOG_OUT("unknown id: %u (0x%x, PS5-new, treated as not loaded)", static_cast<unsigned>(id), static_cast<unsigned>(id));
         // throw std::runtime_error(std::string("sceSysmoduleIsLoaded: unknown id ") + std::to_string(id));
         return 0;
     }
@@ -122,7 +122,12 @@ int APS5_VABI sceSysmoduleLoadModule(std::uint16_t id) {
         throw std::runtime_error("sceSysmoduleLoadModule: invalid id 0");
     }
     if (!findModuleName(id)) {
-        APS5_LOG_OUT("unknown id: %u", static_cast<unsigned>(id));
+        // PS5 added IDs past the PS4 0x107 range (e.g. Ghost of Yotei asks for
+        // 271/272 = 0x10f/0x110, which have no public name and no local lib).
+        // Keep the historical safe-stub (success) so boot continues; a real
+        // dependency would surface later as a missing import, not here. Do not
+        // invent a module name.
+        APS5_LOG_OUT("unknown id: %u (0x%x, PS5-new, stubbed success)", static_cast<unsigned>(id), static_cast<unsigned>(id));
         // throw std::runtime_error(std::string("sceSysmoduleLoadModule: unknown id ") + std::to_string(id));
         return 0;
     }
@@ -154,7 +159,7 @@ int APS5_VABI sceSysmoduleUnloadModule(std::uint16_t id) {
         throw std::runtime_error("sceSysmoduleUnloadModule: invalid id 0");
     }
     if (!findModuleName(id)) {
-        APS5_LOG_OUT("unknown id: %u", static_cast<unsigned>(id));
+        APS5_LOG_OUT("unknown id: %u (0x%x, PS5-new, stubbed success)", static_cast<unsigned>(id), static_cast<unsigned>(id));
         return 0;
     }
     std::lock_guard<std::mutex> lock(gMutex);

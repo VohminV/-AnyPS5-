@@ -362,6 +362,12 @@ constexpr MemoryOpcodeInfo dsOpcodes[] = {
     {0xb3u, RdnaOpcode::DsBpermuteB32, 1, 32, false, false, false},
     {0xdeu, RdnaOpcode::DsWriteB96, 3, 32, false, false, false},
     {0xdfu, RdnaOpcode::DsWriteB128, 4, 32, false, false, false},
+    // BVH traversal stack primitives (RDNA4-documented, observed in the wild
+    // on PS5 titles): push N LDS dwords, pop M, return popped. dataDwords is
+    // the pushed width; translation throws explicitly (see dispatch).
+    {0xe0u, RdnaOpcode::DsBvhStackPush4Pop1RtnB32, 4, 32, false, false, false},
+    {0xe1u, RdnaOpcode::DsBvhStackPush8Pop1RtnB32, 8, 32, false, false, false},
+    {0xe2u, RdnaOpcode::DsBvhStackPush8Pop2RtnB64, 8, 32, false, false, false},
     {0xfeu, RdnaOpcode::DsReadB96, 3, 32, false, false, false},
     {0xffu, RdnaOpcode::DsReadB128, 4, 32, false, false, false},
 };
@@ -437,6 +443,10 @@ RdnaOperand scalarSource(std::uint32_t code) {
         case 126u: operand.kind = RdnaOperandKind::ExecLo; return operand;
         case 127u: operand.kind = RdnaOperandKind::ExecHi; return operand;
         case 239u: operand.kind = RdnaOperandKind::PopsExitingWaveId; return operand;
+        case 235u: operand.kind = RdnaOperandKind::SharedBase; return operand;
+        case 236u: operand.kind = RdnaOperandKind::SharedLimit; return operand;
+        case 237u: operand.kind = RdnaOperandKind::PrivateBase; return operand;
+        case 238u: operand.kind = RdnaOperandKind::PrivateLimit; return operand;
         case 248u: operand.kind = RdnaOperandKind::FloatInlineConstant; operand.value = floatBits(0.15915494309189535f); return operand;
         case 251u: operand.kind = RdnaOperandKind::VccZ; return operand;
         case 252u: operand.kind = RdnaOperandKind::ExecZ; return operand;
@@ -615,7 +625,10 @@ std::uint32_t dsSourceCount(RdnaOpcode opcode) {
         case RdnaOpcode::DsCmpstF64:
         case RdnaOpcode::DsMskorRtnB64:
         case RdnaOpcode::DsCmpstRtnB64:
-        case RdnaOpcode::DsCmpstRtnF64: return 3u;
+        case RdnaOpcode::DsCmpstRtnF64:
+        case RdnaOpcode::DsBvhStackPush4Pop1RtnB32:
+        case RdnaOpcode::DsBvhStackPush8Pop1RtnB32:
+        case RdnaOpcode::DsBvhStackPush8Pop2RtnB64: return 3u;
         case RdnaOpcode::DsMinF32:
         case RdnaOpcode::DsMaxF32: return 2u;
         case RdnaOpcode::DsNop: return 0u;

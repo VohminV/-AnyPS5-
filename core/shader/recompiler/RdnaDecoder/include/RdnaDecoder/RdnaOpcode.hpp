@@ -1092,6 +1092,9 @@ enum class RdnaOpcode : std::uint16_t {
     DsGwsSemaReleaseAll,
     DsGwsBarrier,
     DsOrderedCount,
+    DsBvhStackPush4Pop1RtnB32,
+    DsBvhStackPush8Pop1RtnB32,
+    DsBvhStackPush8Pop2RtnB64,
     Count
 };
 

@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -91,7 +92,22 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     phaseTiming.Phase(DrawRowCapture);
 
     timing.Mark("capture_resources");
-    stageCapture.compiled = invocation.Materialize(*capture);
+    // Attach the shader address to translation failures and dump the code for
+    // offline replay (see DumpFailedShaderCode); the failure itself still
+    // propagates unchanged.
+    try {
+        stageCapture.compiled = invocation.Materialize(*capture);
+    } catch (const std::invalid_argument& error) {
+        DumpFailedShaderCode(program.binary.codeAddress, request.shader.code);
+        char where[32];
+        std::snprintf(where, sizeof(where), "0x%llx", static_cast<unsigned long long>(program.binary.codeAddress));
+        throw std::invalid_argument(std::string("shader ") + where + ": " + error.what());
+    } catch (const std::runtime_error& error) {
+        DumpFailedShaderCode(program.binary.codeAddress, request.shader.code);
+        char where[32];
+        std::snprintf(where, sizeof(where), "0x%llx", static_cast<unsigned long long>(program.binary.codeAddress));
+        throw std::runtime_error(std::string("shader ") + where + ": " + error.what());
+    }
     timing.Mark("materialize");
     ShaderRecompiler::RecompileResult result = *stageCapture.compiled;
     phaseTiming.Phase(DrawRowRecompile);

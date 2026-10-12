@@ -290,9 +290,12 @@ int APS5_VABI sceVideoOutVrrPegToFixedRate() try {
     LibcAwaitExit_nid_postfix();
 }
 
-APS5_EXPORT("kP2L8t3j-aM", sceVideoOutUnknown00);
-int APS5_VABI sceVideoOutUnknown00() try {
-    NotImplemented_nid_no_patch(__func__);
+APS5_EXPORT("kP2L8t3j-aM", sceVideoOutVrrStatus);
+int APS5_VABI sceVideoOutVrrStatus() try {
+    // VideoOutVrrStatus_v1 (cross-emulator logs tag this NID as VRR status;
+    // exact name/signature unconfirmed). This backend has no VRR: report
+    // success without engaging it, like the sibling Vrr peg/unpeg no-ops.
+    // Titles that need VRR treat this as "fixed-rate" and continue.
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -301,6 +304,16 @@ int APS5_VABI sceVideoOutUnknown00() try {
 APS5_EXPORT("LibwuIonIBw", sceVideoOutUnknown01);
 int APS5_VABI sceVideoOutUnknown01() try {
     NotImplemented_nid_no_patch(__func__);
+    return 0;
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
+}
+
+APS5_EXPORT("gWT7X8H0bYs", sceVideoOutUnknown02);
+int APS5_VABI sceVideoOutUnknown02() try {
+    // Same VRR family as sceVideoOutVrrStatus above: the title probes it on
+    // the boot display path (PPSA26344 calls it after VrrStatus). No VRR on
+    // this backend: report success without engaging it, like VrrStatus.
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();

@@ -95,15 +95,86 @@ ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
     return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request), mesh, tessellation);
 }
 
+// P0 diagnosis: per-stage timing + heartbeat for shader preparation. Diagnostic
+// only, no behavior change. Rationale: a 55144-word shader spent 10+ minutes
+// inside one synchronous prepare with zero log output. A background watchdog
+// thread is deliberately NOT used: the recompiler is a pure function of its
+// input running on arbitrary game threads, and killing the game is forbidden.
+// Instead every stage prints an entry line with APS5_TRACE_SHADER_STAGES=1 (a
+// stall is then visible as the last printed stage), and any prepare stage run
+// taking longer than kSlowPrepareMs always prints a summary with input sizes
+// and the per-stage breakdown.
+class PrepareStageClock {
+public:
+    explicit PrepareStageClock(std::uint64_t address, std::uint32_t words)
+        : address_(address), words_(words), begin_(Clock::now()) {
+        static const bool trace = std::getenv("APS5_TRACE_SHADER_STAGES") != nullptr;
+        trace_ = trace;
+    }
+    void Enter(const char* stage) {
+        if (trace_) {
+            std::fprintf(stderr, "[shader-stages] 0x%llx %s start\n", static_cast<unsigned long long>(address_), stage);
+            std::fflush(stderr);
+        }
+        marks_.emplace_back(stage, Clock::now());
+    }
+    void Finish(const std::string& stats) {
+        const auto end = Clock::now();
+        const double totalMs = std::chrono::duration<double, std::milli>(end - begin_).count();
+        static constexpr double kSlowPrepareMs = 10000.0;
+        if (!trace_ && totalMs < kSlowPrepareMs) {
+            return;
+        }
+        std::string line = "[shader-stages] 0x";
+        line += Hex(address_);
+        line += " words=" + std::to_string(words_) + " " + stats;
+        char total[64];
+        std::snprintf(total, sizeof(total), " total=%.1fs", totalMs / 1000.0);
+        line += total;
+        for (std::size_t i = 0; i < marks_.size(); ++i) {
+            const auto next = i + 1u < marks_.size() ? marks_[i + 1u].at : end;
+            const double ms = std::chrono::duration<double, std::milli>(next - marks_[i].at).count();
+            char part[128];
+            std::snprintf(part, sizeof(part), " %s=%.1fs", marks_[i].name, ms / 1000.0);
+            line += part;
+        }
+        line += "\n";
+        std::fwrite(line.data(), 1, line.size(), stderr);
+        std::fflush(stderr);
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    struct Mark {
+        const char* name;
+        Clock::time_point at;
+        Mark(const char* name_, Clock::time_point at_) : name(name_), at(at_) {}
+    };
+    static std::string Hex(std::uint64_t value) {
+        char text[17];
+        std::snprintf(text, sizeof(text), "%llx", static_cast<unsigned long long>(value));
+        return text;
+    }
+    std::uint64_t address_ = 0;
+    std::uint32_t words_ = 0;
+    Clock::time_point begin_;
+    std::vector<Mark> marks_;
+    bool trace_ = false;
+};
+
 }
 
 IrProgram PrepareResourceProgram(const RecompileRequest& request) {
+    PrepareStageClock clock(request.shader.codeAddress, static_cast<std::uint32_t>(request.shader.code.size()));
+    clock.Enter("inputInfo");
     const auto stageKind = toShaderStageKind(request.shader.stage);
     const auto inputInfo = RequestInputInfo(request);
 
+    clock.Enter("decode");
     constexpr RdnaInstructionDecoder decoder;
     const auto decoded = decoder.Decode(request.shader.code);
 
+    clock.Enter("buildCfg");
     constexpr GraphBuilder graphBuilder;
     SwappcInfo swappcInfo;
     swappcInfo.fetchCallAllowed = inputInfo.vertex != nullptr;
@@ -111,6 +182,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     swappcInfo.userDataCount = static_cast<std::uint32_t>(request.context.userData.size());
     auto cfg = graphBuilder.Build(decoded, &swappcInfo);
 
+    clock.Enter("structurize");
     constexpr Structurizer structurizer;
     structurizer.Structurize(cfg);
 
@@ -132,6 +204,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
         embeddedFetch = EmbeddedVertexFetchAnalyzer{}.Analyze(decoded, inputInfo.vertex->fetchAttribReg, inputInfo.vertex->fetchBufferReg, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()), request.context.waveSize);
         translateOptions.embeddedFetch = &embeddedFetch;
     }
+    clock.Enter("translate");
     auto program = translator.Translate(decoded, cfg, translateOptions);
     // Debug aid: APS5_DUMP_IR=<hex code address> (or "all") prints the program after each front-end pass.
     const auto dumpIr = [&](const char* pass) {
@@ -144,6 +217,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     };
     dumpIr("translate");
 
+    clock.Enter("ssaFold");
     constexpr SsaBuilder ssaBuilder;
     ssaBuilder.Rewrite(program);
     dumpIr("ssa");
@@ -171,16 +245,26 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
         deadCodeEliminator.Eliminate(program);
     }
 
+    clock.Enter("srtPlan");
     constexpr SrtWalker srtWalker;
     srtWalker.BuildPlan(program);
     deadCodeEliminator.Eliminate(program);
     dumpIr("srt");
 
+    clock.Enter("track");
     constexpr ResourceTracker resourceTracker;
     resourceTracker.Track(program);
     deadCodeEliminator.Eliminate(program);
     dumpIr("resources");
     program.Resources().srgbDecodeFormats = request.target.srgbDecodeFormats;
+
+    {
+        std::size_t edges = 0;
+        for (const auto& block : cfg.blocks) edges += block.successors.size();
+        std::size_t irOps = 0;
+        for (const auto& block : program.Blocks()) irOps += block->Instructions().size();
+        clock.Finish("instr=" + std::to_string(decoded.instructions.size()) + " blocks=" + std::to_string(cfg.blocks.size()) + " edges=" + std::to_string(edges) + " irOps=" + std::to_string(irOps));
+    }
 
     return program;
 }
@@ -314,6 +398,8 @@ std::uint64_t nextVariantId() {
 }
 
 CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, std::exception_ptr* emissionFailure = nullptr) try {
+    PrepareStageClock clock(request.shader.codeAddress, static_cast<std::uint32_t>(request.shader.code.size()));
+    clock.Enter("staticInterface");
     const auto inputInfo = RequestInputInfo(request);
     constexpr DeadCodeEliminator deadCodeEliminator;
     constexpr ResourceMaterializer resourceMaterializer;
@@ -323,9 +409,11 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     deadCodeEliminator.RemoveIdentities(program);
     deadCodeEliminator.Eliminate(program);
 
+    clock.Enter("collect");
     constexpr ShaderInfoCollector shaderInfoCollector;
     shaderInfoCollector.Collect(program, inputInfo);
 
+    clock.Enter("allocate");
     constexpr BindingAllocator bindingAllocator;
     auto bindings = bindingAllocator.Allocate(program, request.layout);
 
@@ -339,6 +427,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.nonConstantImageOffsets = request.target.nonConstantImageOffsets;
     targetOptions.narrowSubgroupClock = request.target.narrowSubgroupClock;
 
+    clock.Enter("emit");
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
     result.variantId = nextVariantId();
@@ -392,6 +481,8 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
         }
     }
 #endif
+
+    clock.Finish("spirvWords=" + std::to_string(result.spirv.size()) + " buffers=" + std::to_string(program.Info().buffers.size()) + " images=" + std::to_string(program.Info().images.size()) + " samplers=" + std::to_string(program.Info().samplers.size()));
 
     return {request.layout, std::move(program).TakeCompiledInfo(), std::move(static_cast<CompiledBindingLayout&>(bindings)), std::move(result)};
 } catch (const std::bad_alloc&) {

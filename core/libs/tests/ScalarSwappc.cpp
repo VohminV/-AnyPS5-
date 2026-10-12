@@ -213,6 +213,74 @@ static void CheckThrows() {
     });
 }
 
+static void CheckDynamicDiagnosticDetail() {
+    // The dynamic-target error must keep its prefix and name the link/target
+    // registers plus the fetch-call eligibility breakdown for the next game log.
+    try {
+        Build(Program({
+            Sop1(0x00u, 8u, 0x21u, 4u),
+            Sopp(0x04u, 0x01u),
+        }));
+    } catch (const std::exception& error) {
+        const std::string what = error.what();
+        Require(what.find("is not statically resolvable") != std::string::npos);
+        Require(what.find("link s[8]") != std::string::npos);
+        Require(what.find("target s[4:s[5]") != std::string::npos);
+        return;
+    }
+    Require(false);
+}
+
+static void CheckLinkEqualsTargetUniformInput() {
+    // Ghost of Yotei shape: s_swappc_b64 s[14], s[14] with the pair arriving via
+    // user SGPRs (never written in-program). The call's own link write must not
+    // count as a writer of its target pair, so userDataPair=1 and the origin is
+    // uniform-input. With fetchAllowed=0 the call still refuses diagnostically.
+    SwappcInfo info;
+    info.fetchCallAllowed = false;
+    info.userDataBaseRegister = 8u;
+    info.userDataCount = 16u;
+    try {
+        Build(Program({
+            Sop1(0x00u, 14u, 0x21u, 14u),
+            Sopp(0x04u, 0x01u),
+        }), &info);
+    } catch (const std::exception& error) {
+        const std::string what = error.what();
+        Require(what.find("is not statically resolvable") != std::string::npos);
+        Require(what.find("link s[14]") != std::string::npos);
+        Require(what.find("target s[14:s[15]") != std::string::npos);
+        Require(what.find("userDataPair=1") != std::string::npos);
+        Require(what.find("origin=uniform-input") != std::string::npos);
+        Require(what.find("computed=unknown") != std::string::npos);
+        return;
+    }
+    Require(false);
+}
+
+static void CheckLinkEqualsTargetWrittenInput() {
+    // Same shape but s[14] is computed in-program: userDataPair=0 and the origin
+    // names the writer instead of claiming a uniform input.
+    SwappcInfo info;
+    info.fetchCallAllowed = false;
+    info.userDataBaseRegister = 8u;
+    info.userDataCount = 16u;
+    try {
+        Build(Program({
+            Sop2Literal(0x00u, 14u, 0x00u, 14u, 1u),
+            Sop1(0x08u, 14u, 0x21u, 14u),
+            Sopp(0x0cu, 0x01u),
+        }), &info);
+    } catch (const std::exception& error) {
+        const std::string what = error.what();
+        Require(what.find("is not statically resolvable") != std::string::npos);
+        Require(what.find("userDataPair=0") != std::string::npos);
+        Require(what.find("origin=written@0x00000000") != std::string::npos);
+        return;
+    }
+    Require(false);
+}
+
 int main() {
     try {
         CheckDecodeIdentity();
@@ -220,6 +288,9 @@ int main() {
         CheckStaticCallRegion();
         CheckFetchCallAtEntry();
         CheckThrows();
+        CheckDynamicDiagnosticDetail();
+        CheckLinkEqualsTargetUniformInput();
+        CheckLinkEqualsTargetWrittenInput();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "scalar swappc regression: %s\n", error.what());
         return 1;

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -36,6 +37,17 @@ std::string toHexString(std::uint32_t value) {
     char buffer[11];
     std::snprintf(buffer, sizeof(buffer), "0x%08x", value);
     return std::string(buffer);
+}
+
+void TraceSkippedZeroWords(const RdnaProgram& program) {
+    if (program.skippedZeroWords == 0u) {
+        return;
+    }
+    static const bool trace = std::getenv("APS5_TRACE_ZERO_WORDS") != nullptr;
+    if (!trace) {
+        return;
+    }
+    std::fprintf(stderr, "[decoder] skipped %u zero padding words\n", program.skippedZeroWords);
 }
 
 }
@@ -150,10 +162,33 @@ RdnaProgram DecodeRdnaFrontProgram(std::span<const std::uint32_t> front) {
 void DecodeRdnaProgram(std::span<const std::uint32_t> code, RdnaProgram& program) {
     program.instructions.clear();
     program.instructions.reserve(code.size());
+    // Trailing zero padding (alignment past the last instruction) is not
+    // code: no instruction family decodes an all-zero word (VOP2 opcode 0 is
+    // reserved), so a branch overshooting the last endpgm into padding ends
+    // the program instead of failing on the padding. A truncated shader
+    // still fails below: without any endpgm the decode runs off the trimmed
+    // end and throws.
+    while (!code.empty() && code.back() == 0u) {
+        code = code.first(code.size() - 1u);
+    }
     program.code = code;
+    program.skippedZeroWords = 0;
 
     std::uint32_t furthestBranchTarget = 0;
     for (std::uint32_t wordIndex = 0; wordIndex < code.size();) {
+        if (code[wordIndex] == 0u) {
+            // An interior all-zero word is provably not an instruction (see
+            // above: VOP2 opcode 0 is reserved and bit 31 = 0 forces the VOP2
+            // family), so it must be padding between functions or embedded
+            // data such as a zero jump-table offset. Skip exactly one word so
+            // the program counters after it stay aligned. Every program that
+            // decoded successfully before contains no such word and is
+            // unaffected; a word that a branch actually lands on still fails
+            // later as an invalid branch target.
+            ++wordIndex;
+            ++program.skippedZeroWords;
+            continue;
+        }
         const std::uint32_t programCounter = wordIndex * static_cast<std::uint32_t>(sizeof(std::uint32_t));
         program.instructions.push_back(DecodeRdnaInstruction(programCounter, code, wordIndex));
 
@@ -169,6 +204,7 @@ void DecodeRdnaProgram(std::span<const std::uint32_t> code, RdnaProgram& program
         }
 
         if ((instruction.op == RdnaOpcode::SEndpgm || instruction.op == RdnaOpcode::SCodeEnd) && furthestBranchTarget < wordIndex) {
+            TraceSkippedZeroWords(program);
             return;
         }
     }
@@ -218,6 +254,10 @@ RdnaOperand DecodeRdnaScalarSource(std::uint32_t code, std::uint32_t programCoun
         case 126u: operand.kind = RdnaOperandKind::ExecLo; return operand;
         case 127u: operand.kind = RdnaOperandKind::ExecHi; return operand;
         case 239u: operand.kind = RdnaOperandKind::PopsExitingWaveId; return operand;
+        case 235u: operand.kind = RdnaOperandKind::SharedBase; return operand;
+        case 236u: operand.kind = RdnaOperandKind::SharedLimit; return operand;
+        case 237u: operand.kind = RdnaOperandKind::PrivateBase; return operand;
+        case 238u: operand.kind = RdnaOperandKind::PrivateLimit; return operand;
         case 248u:
             operand.kind = RdnaOperandKind::FloatInlineConstant;
             operand.value = std::bit_cast<std::uint32_t>(0.15915494309189535f);
@@ -315,6 +355,10 @@ std::string RdnaOperandToString(const RdnaOperand& operand) {
         case RdnaOperandKind::ExecZ: return "execz";
         case RdnaOperandKind::M0: return "m0";
         case RdnaOperandKind::PopsExitingWaveId: return "pops_exiting_wave_id";
+        case RdnaOperandKind::SharedBase: return "shared_base";
+        case RdnaOperandKind::SharedLimit: return "shared_limit";
+        case RdnaOperandKind::PrivateBase: return "private_base";
+        case RdnaOperandKind::PrivateLimit: return "private_limit";
     }
 
     throw std::invalid_argument("unsupported operand kind for string conversion");

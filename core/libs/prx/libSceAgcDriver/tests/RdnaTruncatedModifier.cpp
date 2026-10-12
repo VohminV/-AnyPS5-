@@ -8,7 +8,55 @@
 
 using namespace ShaderRecompiler;
 
+void Require(bool value, const char* message) {
+    if (!value) {
+        std::fprintf(stderr, "zero-word: %s\n", message);
+        throw std::runtime_error(message);
+    }
+}
+
+void CheckZeroWords() {
+    // ISA 12.7 (gpu_research/amd-rdna2-isa.pdf) has no VOP2 opcode 0, and bit
+    // 31 = 0 forces the VOP2 family, so an all-zero word is provably not an
+    // instruction (padding or embedded data). The program decoder skips such
+    // words one at a time, keeping later program counters aligned.
+    // SOPP opcode 0 is s_nop, opcode 1 is s_endpgm.
+    constexpr std::uint32_t filler = 0x80000000u | (0x7fu << 23u) | (0u << 16u);
+    constexpr std::uint32_t endpgm = 0x80000000u | (0x7fu << 23u) | (1u << 16u);
+    {
+        const std::array<std::uint32_t, 4> words{filler, 0u, 0u, endpgm};
+        const RdnaProgram program = RdnaInstructionDecoder{}.Decode(words);
+        Require(program.instructions.size() == 2u, "interior zeros hide instructions");
+        Require(program.instructions[0].programCounter == 0u, "first instruction moved");
+        Require(program.instructions[1].programCounter == 12u, "program counter past zeros is wrong");
+        Require(program.skippedZeroWords == 2u, "skipped zero count is wrong");
+    }
+    {
+        // Trailing zeros are still trimmed, not counted as skipped.
+        const std::array<std::uint32_t, 3> words{endpgm, 0u, 0u};
+        const RdnaProgram program = RdnaInstructionDecoder{}.Decode(words);
+        Require(program.instructions.size() == 1u, "trailing zeros break the trim");
+        Require(program.skippedZeroWords == 0u, "trimmed zeros counted as skipped");
+    }
+    {
+        // An all-zero span still fails as before (nothing to decode).
+        const std::array<std::uint32_t, 3> words{0u, 0u, 0u};
+        try {
+            static_cast<void>(RdnaInstructionDecoder{}.Decode(words));
+        } catch (const std::out_of_range&) {
+            return;
+        }
+        Require(false, "all-zero span decodes");
+    }
+}
+
 int main() {
+    try {
+        CheckZeroWords();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "zero-word padding: %s\n", error.what());
+        return 1;
+    }
     struct Case {
         const char* name;
         std::uint32_t word;

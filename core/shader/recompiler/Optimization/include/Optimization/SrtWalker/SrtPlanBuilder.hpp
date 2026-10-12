@@ -4,6 +4,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 
 #include <cstdint>
+#include <unordered_set>
 #include <vector>
 
 namespace ShaderRecompiler::Detail {
@@ -25,8 +26,13 @@ private:
     void PatchReads();
 
     IrProgram& _program;
+    // Current DFS path, in order (needed for cycle slices); mirrored by
+    // _visitingSet for O(1) membership: linear finds here scaled with the
+    // path depth and dominated monster-shader preparation time.
     std::vector<IrValue*> _visiting;
-    std::vector<IrValue*> _visited;
+    std::unordered_set<IrValue*> _visitingSet;
+    // Completed values; order is never observed, only membership.
+    std::unordered_set<IrValue*> _visited;
     std::vector<Patch> _patches;
 };
 

@@ -500,6 +500,10 @@ bool TranslationContext::emitMemory(const RdnaInstruction& inst) {
         throw std::runtime_error(std::string(globalWaveSyncName(inst.op)) + " at pc " + std::to_string(inst.programCounter) + ": global wave sync barriers and semaphores shared by waves of different workgroups are not modeled");
     case RdnaOpcode::DsOrderedCount:
         throw std::runtime_error("ds_ordered_count at pc " + std::to_string(inst.programCounter) + ": GDS counters updated in wave launch order are not modeled");
+    case RdnaOpcode::DsBvhStackPush4Pop1RtnB32:
+    case RdnaOpcode::DsBvhStackPush8Pop1RtnB32:
+    case RdnaOpcode::DsBvhStackPush8Pop2RtnB64:
+        throw std::runtime_error("ds_bvh_stack op at pc " + std::to_string(inst.programCounter) + ": BVH traversal stack push/pop over per-lane LDS stacks is not modeled");
     case RdnaOpcode::DsWriteAddtidB32:
         return dsAddtid(inst, true);
     case RdnaOpcode::DsReadAddtidB32:

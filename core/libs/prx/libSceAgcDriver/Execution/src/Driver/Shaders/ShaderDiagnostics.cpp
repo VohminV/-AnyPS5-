@@ -1,10 +1,45 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "ShaderCacheDirectory.hpp"
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
+#include <mutex>
+#include <set>
+#include <span>
+#include <string>
 #include <string_view>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// Dumps (shader_fail_*.bin, shader_slow_*.bin, shader_*.req) go next to the
+// disk cache so `ANYPS5_SHADER_CACHE_DIR=<game>/shader` keeps them in one place
+// and a rerun can reload compiled artifacts. Falls back to the previous CWD
+// behavior when no cache directory is configured.
+std::filesystem::path ShaderDumpDirectory() {
+    if (const char* override = std::getenv("APS5_SHADER_DUMP_DIR")) {
+        if (*override != '\0') return std::filesystem::path(override);
+    }
+    const auto cache = ShaderRecompiler::ShaderCacheDirectory();
+    if (!cache.empty()) return cache;
+    return {};
+}
+
+std::string DumpPath(const char* fileName) {
+    const auto directory = ShaderDumpDirectory();
+    if (directory.empty()) return std::string(fileName);
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    return (directory / fileName).string();
+}
+
+}
 
 void Driver::reportSkip(const char* kind, const std::string& what) {
     static std::mutex reportedMutex;
@@ -54,18 +89,71 @@ std::string Driver::dumpRequest(std::uint64_t address, const ShaderRecompiler::R
     static std::set<std::uint64_t> dumped;
     char name[64];
     std::snprintf(name, sizeof(name), "shader_%llx.req", static_cast<unsigned long long>(address));
+    const std::string path = DumpPath(name);
     std::lock_guard lock(dumpMutex);
-    if (!dumped.insert(address).second) return name;
+    if (!dumped.insert(address).second) return path;
     try {
         const auto text = ShaderRecompiler::RequestSerializer{}.Serialize(request);
-        if (std::FILE* file = std::fopen(name, "wb")) {
+        if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
             std::fwrite(text.data(), 1, text.size(), file);
             std::fclose(file);
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] could not serialize request for 0x%llx: %s\n", static_cast<unsigned long long>(address), error.what());
     }
-    return name;
+    return path;
+}
+
+void DumpFailedShaderCode(std::uint64_t address, std::span<const std::uint32_t> code) {
+    static const bool dump = std::getenv("APS5_DUMP_FAILED_SHADERS") != nullptr;
+    if (!dump || code.empty()) return;
+    static std::mutex dumpMutex;
+    char name[64];
+    std::snprintf(name, sizeof(name), "shader_fail_%llx.bin", static_cast<unsigned long long>(address));
+    const std::string path = DumpPath(name);
+    std::lock_guard lock(dumpMutex);
+    if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(code.data(), sizeof(std::uint32_t), code.size(), file);
+        std::fclose(file);
+    }
+}
+
+void DumpFailedShaderRequest(std::uint64_t address, const std::string& serialized) {
+    static const bool dump = std::getenv("APS5_DUMP_FAILED_SHADERS") != nullptr;
+    if (!dump || serialized.empty()) return;
+    static std::mutex dumpMutex;
+    static std::set<std::uint64_t> dumped;
+    char name[64];
+    std::snprintf(name, sizeof(name), "shader_fail_%llx.req", static_cast<unsigned long long>(address));
+    const std::string path = DumpPath(name);
+    std::lock_guard lock(dumpMutex);
+    if (!dumped.insert(address).second) return;
+    if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(serialized.data(), 1, serialized.size(), file);
+        std::fclose(file);
+    }
+}
+
+PrepareWatchdog::PrepareWatchdog(std::uint64_t address, const char* site, std::span<const std::uint32_t> code)
+    : address_(address), site_(site), code_(code), start_(std::chrono::steady_clock::now()) {
+    std::fprintf(stderr, "[shader] prepare start 0x%llx (%s) words=%zu\n", static_cast<unsigned long long>(address_), site_, code_.size());
+}
+
+PrepareWatchdog::~PrepareWatchdog() {
+    const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+    if (seconds < 30.0) return;
+    std::fprintf(stderr, "[shader] prepare slow 0x%llx (%s) %.1fs\n", static_cast<unsigned long long>(address_), site_, seconds);
+    static std::mutex dumpMutex;
+    static std::set<std::uint64_t> dumped;
+    std::lock_guard lock(dumpMutex);
+    if (!dumped.insert(address_).second || code_.empty()) return;
+    char name[64];
+    std::snprintf(name, sizeof(name), "shader_slow_%llx.bin", static_cast<unsigned long long>(address_));
+    const std::string path = DumpPath(name);
+    if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(code_.data(), sizeof(std::uint32_t), code_.size(), file);
+        std::fclose(file);
+    }
 }
 
 }
