@@ -49,6 +49,10 @@ public:
     // construction: the attachment formats alone decide).
     void Continue(VkCommandBuffer commands, const State& state) const;
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
+    // True when depth-bounds requests on this pipeline are served by the CPU
+    // fallback (transformed fragment shader, push-constant bounds) because
+    // the device lacks the feature.
+    bool DepthBoundsFallback() const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;
 
@@ -68,6 +72,8 @@ private:
     std::size_t attachments = 0;
     std::size_t colorAttachments = 0;
     bool depthBounds = false;
+    bool depthBoundsFallback = false;
+    std::vector<std::uint32_t> fallbackFragmentSpirv;
     bool depthBias = false;
     std::vector<CachedFramebuffer> framebuffers;
 };

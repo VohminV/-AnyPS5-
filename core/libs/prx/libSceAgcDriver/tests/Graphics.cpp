@@ -1,6 +1,7 @@
 #include "BdaTests.hpp"
 #include "GraphicsTests.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthBoundsFallback.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -15,7 +16,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
@@ -871,6 +874,297 @@ void DepthBoundsBiasTests() {
     }
     state = AgcDriver::Graphics::DecodeState(cleared);
     Require(state.depthBias && state.depthBiasConstant == 4.0f && state.depthBiasClamp == 0.0f, "a depth bias clamp the title never writes must decode as its reset value 0");
+}
+
+void DepthBoundsFallbackTests() {
+    using AgcDriver::Graphics::DepthBoundsBackend;
+    using AgcDriver::Graphics::ResolveDepthBoundsBackend;
+    using AgcDriver::Graphics::NeedsDepthBoundsFallback;
+    Require(ResolveDepthBoundsBackend(true, "") == DepthBoundsBackend::Hardware, "auto mode missed hardware");
+    Require(ResolveDepthBoundsBackend(false, "") == DepthBoundsBackend::CpuFallback, "auto mode missed fallback");
+    Require(ResolveDepthBoundsBackend(true, "auto") == DepthBoundsBackend::Hardware, "explicit auto missed hardware");
+    Require(ResolveDepthBoundsBackend(false, "AUTO") == DepthBoundsBackend::CpuFallback, "override is not case-insensitive");
+    Require(ResolveDepthBoundsBackend(true, "hardware") == DepthBoundsBackend::Hardware, "forced hardware missed");
+    Require(ResolveDepthBoundsBackend(false, "cpu") == DepthBoundsBackend::CpuFallback, "forced fallback missed");
+    Require(ResolveDepthBoundsBackend(true, "Cpu") == DepthBoundsBackend::CpuFallback, "forced fallback must win on capable hardware");
+    expectFailure([] { ResolveDepthBoundsBackend(false, "hardware"); }, "does not support depthBounds");
+    expectFailure([] { ResolveDepthBoundsBackend(true, "bogus"); }, "auto, hardware or cpu");
+    Require(AgcDriver::Graphics::DepthBoundsBackendText(DepthBoundsBackend::Hardware) == std::string_view("hardware"), "backend text changed");
+    Require(AgcDriver::Graphics::DepthBoundsBackendText(DepthBoundsBackend::CpuFallback) == std::string_view("cpu-fallback"), "backend text changed");
+    for (const bool depth : {false, true}) {
+        for (const bool test : {false, true}) {
+            for (const bool mode : {false, true}) {
+                Require(NeedsDepthBoundsFallback(depth, test, mode) == (depth && test && mode), "fallback gating changed");
+            }
+        }
+    }
+
+    struct Words {
+        std::vector<std::uint32_t> words{0x07230203u, 0x00010000u, 0u, 2u, 0u};
+        std::uint32_t next = 1;
+        std::uint32_t Alloc() { return next++; }
+        void Inst(std::uint16_t op, std::initializer_list<std::uint32_t> operands) {
+            words.push_back((std::uint32_t(operands.size() + 1) << 16u) | op);
+            for (const auto value : operands) words.push_back(value);
+        }
+        void Finish() { words[3] = next; }
+    };
+    struct Fragment {
+        Words module;
+        std::uint32_t func = 0;
+        std::uint32_t entry = 0;
+        std::uint32_t fragVar = 0;
+        std::uint32_t pushVar = 0;
+    };
+    const auto buildFragment = [](bool fragCoord, bool push, bool depthWrite, bool secondEntry, std::uint32_t pushLength) {
+        Fragment fragment;
+        auto& module = fragment.module;
+        const std::uint32_t voidTy = module.Alloc();
+        const std::uint32_t fnTy = module.Alloc();
+        fragment.func = module.Alloc();
+        fragment.entry = module.Alloc();
+        std::uint32_t fragVar = 0, pushVar = 0;
+        std::vector<std::uint32_t> entryInterface;
+        std::uint32_t v4f32 = 0, ptrInputV4 = 0, pushStruct = 0, pushArr = 0, pushLen = 0, ptrPushStruct = 0;
+        std::uint32_t f32 = 0, u32 = 0;
+        if (fragCoord) {
+            f32 = module.Alloc();
+            v4f32 = module.Alloc();
+            ptrInputV4 = module.Alloc();
+            fragVar = module.Alloc();
+            entryInterface.push_back(fragVar);
+        }
+        if (push) {
+            u32 = module.Alloc();
+            pushArr = module.Alloc();
+            pushStruct = module.Alloc();
+            pushLen = module.Alloc();
+            ptrPushStruct = module.Alloc();
+            pushVar = module.Alloc();
+            entryInterface.push_back(pushVar);
+        }
+        module.Inst(spv::OpCapability, {spv::CapabilityShader});
+        module.Inst(spv::OpMemoryModel, {spv::AddressingModelLogical, spv::MemoryModelGLSL450});
+        module.words.push_back((static_cast<std::uint32_t>(5 + entryInterface.size()) << 16u) | spv::OpEntryPoint);
+        module.words.push_back(spv::ExecutionModelFragment);
+        module.words.push_back(fragment.func);
+        module.words.push_back(0x6e69616du);
+        module.words.push_back(0u);
+        for (const auto id : entryInterface) module.words.push_back(id);
+        module.Inst(spv::OpExecutionMode, {fragment.func, spv::ExecutionModeOriginUpperLeft});
+        if (depthWrite) module.Inst(spv::OpExecutionMode, {fragment.func, spv::ExecutionModeDepthReplacing});
+        std::uint32_t other = 0, otherEntry = 0;
+        if (secondEntry) {
+            other = module.Alloc();
+            otherEntry = module.Alloc();
+            module.Inst(spv::OpEntryPoint, {spv::ExecutionModelFragment, other, 0x6e69616du, 0u});
+            module.Inst(spv::OpExecutionMode, {other, spv::ExecutionModeOriginUpperLeft});
+        }
+        module.Inst(spv::OpTypeVoid, {voidTy});
+        module.Inst(spv::OpTypeFunction, {fnTy, voidTy});
+        if (fragCoord) {
+            module.Inst(spv::OpTypeFloat, {f32, 32});
+            module.Inst(spv::OpTypeVector, {v4f32, f32, 4});
+            module.Inst(spv::OpTypePointer, {ptrInputV4, spv::StorageClassInput, v4f32});
+            module.Inst(spv::OpDecorate, {fragVar, spv::DecorationBuiltIn, spv::BuiltInFragCoord});
+            module.Inst(spv::OpVariable, {ptrInputV4, fragVar, spv::StorageClassInput});
+        }
+        if (push) {
+            module.Inst(spv::OpTypeInt, {u32, 32, 0});
+            module.Inst(spv::OpConstant, {u32, pushLen, pushLength});
+            module.Inst(spv::OpTypeArray, {pushArr, u32, pushLen});
+            module.Inst(spv::OpTypeStruct, {pushStruct, pushArr});
+            module.Inst(spv::OpTypePointer, {ptrPushStruct, spv::StorageClassPushConstant, pushStruct});
+            module.Inst(spv::OpDecorate, {pushArr, spv::DecorationArrayStride, 4});
+            module.Inst(spv::OpDecorate, {pushStruct, spv::DecorationBlock});
+            module.Inst(spv::OpMemberDecorate, {pushStruct, 0, spv::DecorationOffset, 0});
+            module.Inst(spv::OpVariable, {ptrPushStruct, pushVar, spv::StorageClassPushConstant});
+        }
+        if (secondEntry) {
+            module.Inst(spv::OpFunction, {voidTy, other, 0u, fnTy});
+            module.Inst(spv::OpLabel, {otherEntry});
+            module.Inst(spv::OpReturn, {});
+            module.Inst(spv::OpFunctionEnd, {});
+        }
+        module.Inst(spv::OpFunction, {voidTy, fragment.func, 0u, fnTy});
+        module.Inst(spv::OpLabel, {fragment.entry});
+        module.Inst(spv::OpReturn, {});
+        module.Inst(spv::OpFunctionEnd, {});
+        module.Finish();
+        fragment.fragVar = fragVar;
+        fragment.pushVar = pushVar;
+        return fragment;
+    };
+    // Executes the injected prologue of transformed words with the given
+    // FragCoord.z and push dwords; true means the fragment is discarded.
+    const auto simulate = [](const std::vector<std::uint32_t>& words, float z, float minBound, float maxBound) {
+        Require(words.size() >= 5 && words[0] == 0x07230203u, "not SPIR-V");
+        std::size_t pos = 5;
+        std::uint32_t entryFunc = 0;
+        while (pos < words.size()) {
+            const std::uint16_t count = words[pos] >> 16u;
+            Require(count != 0 && pos + count <= words.size(), "truncated module");
+            if ((words[pos] & 0xffffu) == spv::OpEntryPoint && count >= 4 && words[pos + 1] == spv::ExecutionModelFragment) {
+                entryFunc = words[pos + 2];
+                break;
+            }
+            pos += count;
+        }
+        Require(entryFunc != 0, "no fragment entry point");
+        pos = 5;
+        bool inEntry = false;
+        std::map<std::uint32_t, float> floats;
+        std::map<std::uint32_t, bool> bools;
+        std::map<std::uint32_t, std::uint32_t> pointers;
+        std::map<std::uint32_t, std::uint32_t> constWords;
+        for (std::size_t scan = 5; scan < words.size();) {
+            const std::uint16_t scanCount = words[scan] >> 16u;
+            Require(scanCount != 0 && scan + scanCount <= words.size(), "truncated module");
+            if ((words[scan] & 0xffffu) == spv::OpConstant && scanCount == 4) constWords[words[scan + 2]] = words[scan + 3];
+            scan += scanCount;
+        }
+        std::array<float, 4> fragCoord{0.0f, 0.0f, z, 1.0f};
+        const std::array<float, 32> push = [&] {
+            std::array<float, 32> values{};
+            values[30] = minBound;
+            values[31] = maxBound;
+            return values;
+        }();
+        bool killed = false;
+        while (pos < words.size()) {
+            const std::uint16_t op = words[pos] & 0xffffu;
+            const std::uint16_t count = words[pos] >> 16u;
+            if (op == spv::OpFunction) inEntry = count >= 3 && words[pos + 2] == entryFunc;
+            if (inEntry) {
+                if (op == spv::OpLoad && count == 4) {
+                    const auto found = pointers.find(words[pos + 3]);
+                    floats[words[pos + 2]] = found != pointers.end() ? push.at(found->second) : 0.0f;
+                } else if (op == spv::OpCompositeExtract && count == 5) {
+                    floats[words[pos + 2]] = fragCoord.at(words[pos + 4]);
+                } else if (op == spv::OpAccessChain && count == 6) {
+                    const auto first = constWords.find(words[pos + 4]);
+                    const auto second = constWords.find(words[pos + 5]);
+                    Require(first != constWords.end() && second != constWords.end(), "bounds access chain is not constant-indexed");
+                    Require(first->second == 0 && (second->second == 30 || second->second == 31), "bounds read outside dwords 30/31");
+                    pointers[words[pos + 2]] = second->second;
+                } else if (op == spv::OpBitcast && count == 4) {
+                    floats[words[pos + 2]] = floats.at(words[pos + 3]);
+                } else if ((op == spv::OpFOrdLessThan || op == spv::OpFOrdGreaterThan) && count == 5) {
+                    const float left = floats.at(words[pos + 3]);
+                    const float right = floats.at(words[pos + 4]);
+                    const bool ordered = !std::isnan(left) && !std::isnan(right);
+                    bools[words[pos + 2]] = ordered && (op == spv::OpFOrdLessThan ? left < right : left > right);
+                } else if (op == spv::OpLogicalOr && count == 5) {
+                    bools[words[pos + 2]] = bools.at(words[pos + 3]) || bools.at(words[pos + 4]);
+                } else if (op == spv::OpBranchConditional && count == 4) {
+                    const bool taken = bools.at(words[pos + 1]);
+                    pos += count;
+                    Require(pos < words.size() && (words[pos] & 0xffffu) == spv::OpLabel, "kill block is missing");
+                    if (taken) {
+                        Require(pos + 2 < words.size() && (words[pos + 2] & 0xffffu) == spv::OpKill, "kill block does not kill");
+                        killed = true;
+                    }
+                    return killed;
+                }
+            }
+            pos += count;
+        }
+        throw std::runtime_error("prologue simulation did not reach the branch");
+    };
+    const auto transform = [](Fragment fragment) { return AgcDriver::Graphics::ApplyDepthBoundsFallback(fragment.module.words); };
+    {
+        // Bare module: the transform declares FragCoord and the push block.
+        const auto out = transform(buildFragment(false, false, false, false, 0));
+        Require(simulate(out, 0.5f, 0.0f, 1.0f) == false, "in-range fragment was discarded");
+        Require(simulate(out, 0.0f, 0.0f, 1.0f) == false, "lower edge was discarded");
+        Require(simulate(out, 1.0f, 0.0f, 1.0f) == false, "upper edge was discarded");
+        Require(simulate(out, -0.1f, 0.0f, 1.0f) == true, "below-range fragment survived");
+        Require(simulate(out, 1.1f, 0.0f, 1.0f) == true, "above-range fragment survived");
+        Require(simulate(out, 0.5f, 0.4f, 0.6f) == false, "narrow in-range fragment was discarded");
+        Require(simulate(out, 0.39f, 0.4f, 0.6f) == true, "narrow below-range fragment survived");
+        Require(simulate(out, 0.61f, 0.4f, 0.6f) == true, "narrow above-range fragment survived");
+        Require(simulate(out, 0.5f, 0.7f, 0.3f) == true, "empty range kept a fragment");
+        Require(simulate(out, 0.0f, 0.7f, 0.3f) == true, "empty range kept a fragment");
+        Require(simulate(out, std::numeric_limits<float>::quiet_NaN(), 0.0f, 1.0f) == false, "NaN depth was discarded");
+        Require(simulate(out, std::numeric_limits<float>::infinity(), 0.0f, 1.0f) == true, "infinite depth survived");
+    }
+    {
+        // Existing FragCoord and push block are reused, not redeclared.
+        auto bare = buildFragment(true, true, false, false, 32);
+        const auto countVars = [](const std::vector<std::uint32_t>& words) {
+            std::size_t found = 0;
+            for (std::size_t pos = 5; pos < words.size();) {
+                const std::uint16_t count = words[pos] >> 16u;
+                Require(count != 0 && pos + count <= words.size(), "truncated module");
+                if ((words[pos] & 0xffffu) == spv::OpVariable) ++found;
+                pos += count;
+            }
+            return found;
+        };
+        Require(countVars(bare.module.words) == 2, "fixture layout changed");
+        const auto out = transform(std::move(bare));
+        Require(countVars(out) == 2, "existing variables were redeclared");
+        Require(simulate(out, 0.5f, 0.0f, 1.0f) == false, "reused interface broke the check");
+        Require(simulate(out, 2.0f, 0.0f, 1.0f) == true, "reused interface broke the check");
+    }
+    {
+        // FragCoord without a push block: only the block is added.
+        const auto out = transform(buildFragment(true, false, false, false, 0));
+        Require(simulate(out, 0.5f, 0.0f, 1.0f) == false, "added push block broke the check");
+        Require(simulate(out, -1.0f, 0.0f, 1.0f) == true, "added push block broke the check");
+    }
+    {
+        // Real shaders carry line debug info: OpLine may precede the entry label.
+        Fragment lined;
+        auto& module = lined.module;
+        const std::uint32_t voidTy = module.Alloc();
+        const std::uint32_t fnTy = module.Alloc();
+        lined.func = module.Alloc();
+        lined.entry = module.Alloc();
+        const std::uint32_t file = module.Alloc();
+        module.Inst(spv::OpCapability, {spv::CapabilityShader});
+        module.Inst(spv::OpMemoryModel, {spv::AddressingModelLogical, spv::MemoryModelGLSL450});
+        module.Inst(spv::OpEntryPoint, {spv::ExecutionModelFragment, lined.func, 0x6e69616du, 0u});
+        module.Inst(spv::OpExecutionMode, {lined.func, spv::ExecutionModeOriginUpperLeft});
+        module.Inst(spv::OpTypeVoid, {voidTy});
+        module.Inst(spv::OpTypeFunction, {fnTy, voidTy});
+        module.Inst(spv::OpString, {file, 0x656c6966u, 0u});
+        module.Inst(spv::OpFunction, {voidTy, lined.func, 0u, fnTy});
+        module.Inst(spv::OpLine, {file, 10, 20});
+        module.Inst(spv::OpLabel, {lined.entry});
+        module.Inst(spv::OpReturn, {});
+        module.Inst(spv::OpFunctionEnd, {});
+        module.Finish();
+        const auto out = transform(std::move(lined));
+        Require(simulate(out, 0.5f, 0.0f, 1.0f) == false, "line debug info broke the check");
+        Require(simulate(out, 5.0f, 0.0f, 1.0f) == true, "line debug info broke the check");
+    }
+    expectFailure([&] { transform(buildFragment(false, false, true, false, 0)); }, "writes depth");
+    expectFailure([&] { transform(buildFragment(false, false, false, true, 0)); }, "several fragment entry points");
+    expectFailure([&] { transform(buildFragment(false, true, false, false, 7)); }, "u32[32]");
+    expectFailure([&] { transform(Fragment{}); }, "no fragment entry point");
+    expectFailure([] { return AgcDriver::Graphics::ApplyDepthBoundsFallback(std::vector<std::uint32_t>{0u, 1u, 2u}); }, "not SPIR-V");
+    {
+        // Compute-only module has no fragment entry point.
+        Fragment compute;
+        auto& module = compute.module;
+        const std::uint32_t voidTy = module.Alloc();
+        const std::uint32_t fnTy = module.Alloc();
+        compute.func = module.Alloc();
+        const std::uint32_t entry = module.Alloc();
+        module.Inst(spv::OpCapability, {spv::CapabilityShader});
+        module.Inst(spv::OpMemoryModel, {spv::AddressingModelLogical, spv::MemoryModelGLSL450});
+        module.Inst(spv::OpEntryPoint, {spv::ExecutionModelGLCompute, compute.func, 0x6e69616du, 0u});
+        module.Inst(spv::OpExecutionMode, {compute.func, spv::ExecutionModeLocalSize, 1, 1, 1});
+        module.Inst(spv::OpTypeVoid, {voidTy});
+        module.Inst(spv::OpTypeFunction, {fnTy, voidTy});
+        module.Inst(spv::OpFunction, {voidTy, compute.func, 0u, fnTy});
+        module.Inst(spv::OpLabel, {entry});
+        module.Inst(spv::OpReturn, {});
+        module.Inst(spv::OpFunctionEnd, {});
+        module.Finish();
+        expectFailure([&] { transform(std::move(compute)); }, "no fragment entry point");
+    }
 }
 
 alignas(256) std::array<std::uint8_t, 4> dccKeys{};
@@ -2789,6 +3083,7 @@ int main() {
         DepthStencilTests();
         ZExportTests();
         DepthBoundsBiasTests();
+        DepthBoundsFallbackTests();
         conservativeZExportTests();
         orderedPixelShaderTests();
         ConservativeRasterizationTests();

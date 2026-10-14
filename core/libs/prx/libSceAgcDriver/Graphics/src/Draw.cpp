@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthBoundsFallback.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -1429,6 +1430,14 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
         stages = PushConstantStages(shaders);
     }
     if (!state.stages.mesh) {
+        if (pipeline.DepthBoundsFallback()) {
+            // The fallback shader reads the bounds from the fixed tail slot
+            // (see DepthBoundsFallback); the pipeline reserves no shader
+            // range there, so this write cannot clobber shader constants.
+            std::memcpy(block.data() + DepthBoundsPushOffsetBytes, &state.minDepthBounds, sizeof(float));
+            std::memcpy(block.data() + DepthBoundsPushOffsetBytes + sizeof(float), &state.maxDepthBounds, sizeof(float));
+            stages |= VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
         pipeline.PushConstants(commands, stages, block);
         return;
     }

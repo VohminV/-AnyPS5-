@@ -123,6 +123,9 @@ struct Context {
     bool drawIndirectCount = false;
     bool occlusionQueryPrecise = false;
     bool depthBounds = false;
+    // True when depth-bounds requests are served by the CPU fallback (shader
+    // discard with push-constant bounds) instead of hardware state.
+    bool depthBoundsFallback = false;
     bool depthBiasClamp = false;
     bool samplerFilterMinmax = false;
     bool conservativeRasterization = false;

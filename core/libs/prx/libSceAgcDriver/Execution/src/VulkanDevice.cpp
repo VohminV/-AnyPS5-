@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthBoundsFallback.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -228,6 +229,8 @@ struct VulkanDevice::State {
     std::uint32_t srgbDecodeFormats = 0;
     bool depthClamp = false;
     bool depthBounds = false;
+    Graphics::DepthBoundsBackend depthBoundsMode = Graphics::DepthBoundsBackend::Hardware;
+    bool depthBoundsFallback = false;
     bool depthBiasClamp = false;
     bool occlusionQueryPrecise = false;
     VkDeviceSize hostImportAlignment = 0;
@@ -1011,6 +1014,44 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->depthClamp = enabled.depthClamp == VK_TRUE;
     enabled.depthBounds = available.depthBounds;
     state->depthBounds = enabled.depthBounds == VK_TRUE;
+    {
+        const char* override = std::getenv("APS5_DEPTH_BOUNDS");
+        Graphics::DepthBoundsBackend mode = Graphics::DepthBoundsBackend::Hardware;
+        const char* reason = "";
+        try {
+            mode = Graphics::ResolveDepthBoundsBackend(available.depthBounds == VK_TRUE, override != nullptr ? override : "");
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[DepthBounds] backend=unsupported device=\"%s\" supported=%u reason=\"%s\"\n",
+                state->properties.deviceName, static_cast<unsigned>(available.depthBounds == VK_TRUE), error.what());
+            std::fflush(stderr);
+            throw;
+        }
+        state->depthBoundsMode = mode;
+        state->depthBoundsFallback = mode == Graphics::DepthBoundsBackend::CpuFallback;
+        if (mode == Graphics::DepthBoundsBackend::Hardware) {
+            reason = override != nullptr && *override != '\0' ? "forced by APS5_DEPTH_BOUNDS=hardware" : "device supports depthBounds";
+        } else {
+            reason = override != nullptr && *override != '\0' ? "forced by APS5_DEPTH_BOUNDS=cpu" : "device lacks depthBounds; CPU fallback";
+        }
+        const char* driverName = "unknown";
+        const char* driverInfo = "";
+        std::uint32_t driverId = 0;
+        if (state->properties.apiVersion >= VK_API_VERSION_1_2) {
+            VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+            state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
+            if (driver.driverID != 0) {
+                driverName = driver.driverName;
+                driverInfo = driver.driverInfo;
+                driverId = static_cast<std::uint32_t>(driver.driverID);
+            }
+        }
+        std::fprintf(stderr, "[DepthBounds] backend=%s device=\"%s\" supported=%u reason=\"%s\" vendor=0x%x device=0x%x type=%d api=0x%x driver=\"%s\" driverId=%u driverInfo=\"%s\"\n",
+            Graphics::DepthBoundsBackendText(mode), state->properties.deviceName, static_cast<unsigned>(available.depthBounds == VK_TRUE), reason,
+            state->properties.vendorID, state->properties.deviceID, static_cast<int>(state->properties.deviceType), state->properties.apiVersion, driverName, driverId,
+            driverInfo);
+        std::fflush(stderr);
+    }
     enabled.depthBiasClamp = available.depthBiasClamp;
     state->depthBiasClamp = enabled.depthBiasClamp == VK_TRUE;
     enabled.occlusionQueryPrecise = available.occlusionQueryPrecise;
@@ -2631,6 +2672,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.drawIndirectFirstInstance = state->drawIndirectFirstInstance;
     context.multiDrawIndirect = state->multiDrawIndirect;
     context.depthBounds = state->depthBounds;
+    context.depthBoundsFallback = state->depthBoundsFallback;
     context.depthBiasClamp = state->depthBiasClamp;
     context.samplerFilterMinmax = state->samplerFilterMinmax;
     context.conservativeRasterization = state->conservativeRasterization;
