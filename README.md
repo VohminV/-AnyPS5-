@@ -22,6 +22,18 @@ Unsupported or unexpected states strictly throw `std::runtime_error`. `what()` i
 
 The [shader recompiler](core/shader/recompiler/Recompiler.cpp) successfully produces SPIR-V (validated via [Spirv-Tools](3rdparty/SPIRV-Tools) when built with `ANYPS5_ENABLE_SPIRV_TOOLS`).
 
+## Diagnostics and launch
+
+```sh
+python tools/preflight.py --target linux --game-dir "/path/to/game"   # environment check first
+python tools/inspect_executable.py eboot.bin --game-dir "/path/to/game" # content-based format check
+python tools/plan.py --target linux --game-dir "/path/to/game"          # execution plan
+./tools/run_game.sh --game-dir "/path/to/game" --target linux           # prepare (add --run to launch)
+```
+
+Windows: `.\tools\run_game.ps1 --game-dir "D:\Games\MyGame" --target windows`.
+Details: [PROMT workflow](PROMT.md), [diagnostics architecture](docs/dev/DIAGNOSTICS.md).
+
 ## Compatibility
 
 See the [game compatibility list](docs/user/COMPATIBILITY.md) for tested games and known issues.
