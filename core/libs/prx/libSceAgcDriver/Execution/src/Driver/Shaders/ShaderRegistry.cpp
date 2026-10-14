@@ -340,6 +340,7 @@ RegisteredShaderState DecodeRegisteredState(const ShaderSnapshot& snapshot) {
 // values, same specials, same semantics and user-data contents. Guest reads
 // throw when unmapped; any failure here means "not an alias" and the caller
 // keeps its strict error.
+constexpr const char* kUserDataPresenceMismatch = "user-data presence differs";
 const char* HeaderAliasMismatch(const ShaderSnapshot& snapshot, const Shader* shader) {
     try {
         if (snapshot.registeredState == nullptr) return "no registered state";
@@ -405,7 +406,7 @@ const char* HeaderAliasMismatch(const ShaderSnapshot& snapshot, const Shader* sh
         const bool liveHasUserData = live.user_data != nullptr;
         ShaderUserData storedUserData{};
         bool storedHasUserData = storedHeader.user_data != nullptr;
-        if (liveHasUserData != storedHasUserData) return "user-data presence differs";
+        if (liveHasUserData != storedHasUserData) return kUserDataPresenceMismatch;
         if (liveHasUserData) {
             ShaderUserData liveUserData{};
             std::vector<std::byte> liveUdBytes(sizeof(ShaderUserData));
@@ -441,6 +442,24 @@ const char* HeaderAliasMismatch(const ShaderSnapshot& snapshot, const Shader* sh
     } catch (...) {
         return "guest read failed";
     }
+}
+
+// Classifies the single HeaderAliasMismatch outcome a bound header copy may
+// still resolve with: every compared field (code, types, sizes, register and
+// semantics contents, specials) matches and only user-data presence differs
+// (PPSA21567 binds such a copy of a vertex shader header with user_data set
+// to null). The draw keeps resolving with the registered snapshot's
+// metadata, as for an identical alias. Any other mismatch - including an
+// unreadable header - must still refuse the draw; the strcmp (not a pointer
+// comparison) keeps that decision correct even if the reason text moves.
+bool IsUserDataPresenceAlias(const char* aliasMismatch, std::uint64_t codeAddress, std::uint64_t keptHeader, std::uint64_t aliasHeader) {
+    if (std::strcmp(aliasMismatch, kUserDataPresenceMismatch) != 0) return false;
+    static unsigned long long reports = 0;
+    if (++reports <= 4) {
+        APS5_LOG_ERR("Shader header user-data presence alias accepted: code=0x%llx registered=0x%llx actual=0x%llx",
+            static_cast<unsigned long long>(codeAddress), static_cast<unsigned long long>(keptHeader), static_cast<unsigned long long>(aliasHeader));
+    }
+    return true;
 }
 
 std::uint32_t RegisterValue(const Registers& registers, std::uint32_t offset) {
@@ -696,7 +715,8 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
             const auto& snapshot = *registry->at(address);
             if (snapshot.headerAddress != reinterpret_cast<std::uintptr_t>(shader)) {
                 const char* aliasMismatch = HeaderAliasMismatch(snapshot, shader);
-                if (aliasMismatch != nullptr) {
+                if (aliasMismatch != nullptr &&
+                    !IsUserDataPresenceAlias(aliasMismatch, address, snapshot.headerAddress, reinterpret_cast<std::uintptr_t>(shader))) {
                     char detail[256];
                     std::snprintf(detail, sizeof(detail), "graphics ABI refers to a replaced shader header (%s; code=0x%llx registered=0x%llx actual=0x%llx)",
                         aliasMismatch,
@@ -704,13 +724,14 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
                         static_cast<unsigned long long>(snapshot.headerAddress),
                         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(shader)));
                     require(false, detail);
-                }
-                static unsigned long long aliasReports = 0;
-                if (++aliasReports <= 4) {
-                    APS5_LOG_ERR("Graphics ABI header alias shared: code=0x%llx registered=0x%llx actual=0x%llx",
-                        static_cast<unsigned long long>(address),
-                        static_cast<unsigned long long>(snapshot.headerAddress),
-                        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(shader)));
+                } else if (aliasMismatch == nullptr) {
+                    static unsigned long long aliasReports = 0;
+                    if (++aliasReports <= 4) {
+                        APS5_LOG_ERR("Graphics ABI header alias shared: code=0x%llx registered=0x%llx actual=0x%llx",
+                            static_cast<unsigned long long>(address),
+                            static_cast<unsigned long long>(snapshot.headerAddress),
+                            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(shader)));
+                    }
                 }
             }
             require(snapshot.registeredState != nullptr, "registered shader state is missing");
@@ -779,13 +800,16 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
         snapshot = shaders->at(address);
         if (snapshot->headerAddress != reinterpret_cast<std::uintptr_t>(shader)) {
             if (const char* aliasMismatch = HeaderAliasMismatch(*snapshot, shader)) {
-                char detail[256];
-                std::snprintf(detail, sizeof(detail), "static ABI refers to a replaced shader header (%s; code=0x%llx registered=0x%llx actual=0x%llx)",
-                    aliasMismatch,
-                    static_cast<unsigned long long>(address),
-                    static_cast<unsigned long long>(snapshot->headerAddress),
-                    static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(shader)));
-                require(false, detail);
+                const auto shaderAddress = reinterpret_cast<std::uintptr_t>(shader);
+                if (!IsUserDataPresenceAlias(aliasMismatch, address, snapshot->headerAddress, shaderAddress)) {
+                    char detail[256];
+                    std::snprintf(detail, sizeof(detail), "static ABI refers to a replaced shader header (%s; code=0x%llx registered=0x%llx actual=0x%llx)",
+                        aliasMismatch,
+                        static_cast<unsigned long long>(address),
+                        static_cast<unsigned long long>(snapshot->headerAddress),
+                        static_cast<unsigned long long>(shaderAddress));
+                    require(false, detail);
+                }
             }
         }
     }
@@ -851,14 +875,16 @@ void Driver::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::
             const auto snapshot = shaders->at(address);
             if (snapshot->headerAddress != reinterpret_cast<std::uintptr_t>(shader)) {
                 if (const char* aliasMismatch = HeaderAliasMismatch(*snapshot, shader)) {
-                    char detail[256];
-                    std::snprintf(detail, sizeof(detail), "rectangle ABI refers to a replaced shader header (%s; code=0x%llx registered=0x%llx actual=0x%llx)",
-                        aliasMismatch,
-                        static_cast<unsigned long long>(address),
-                        static_cast<unsigned long long>(snapshot->headerAddress),
-                        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(shader)));
-
-                    require(false, detail);
+                    const auto shaderAddress = reinterpret_cast<std::uintptr_t>(shader);
+                    if (!IsUserDataPresenceAlias(aliasMismatch, address, snapshot->headerAddress, shaderAddress)) {
+                        char detail[256];
+                        std::snprintf(detail, sizeof(detail), "rectangle ABI refers to a replaced shader header (%s; code=0x%llx registered=0x%llx actual=0x%llx)",
+                            aliasMismatch,
+                            static_cast<unsigned long long>(address),
+                            static_cast<unsigned long long>(snapshot->headerAddress),
+                            static_cast<unsigned long long>(shaderAddress));
+                        require(false, detail);
+                    }
                 }
             }
             return snapshot;

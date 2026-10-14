@@ -6,6 +6,8 @@
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -196,6 +198,7 @@ void Registration(bool indirect) {
         std::array<ShaderRegister, 9> registers{};
         std::array<ShaderRegister, 2> context{{{0x1b6, 0}, {0x1b6, 1}}};
         ShaderSpecialRegs specials{};
+        ShaderUserData users{};
     } header;
     const auto address = reinterpret_cast<std::uintptr_t>(code.data());
     header.shader.file_header = 0x34333231u;
@@ -224,6 +227,37 @@ void Registration(bool indirect) {
         }));
     }
     for (auto& registration : registrations) registration.get();
+    Shader copy = header.shader;
+    copy.user_data = reinterpret_cast<ShaderUserData*>(&copy);
+    AgcDriverResolveShaderAbi_nid_postfix(&copy, {}, {});
+    alignas(Shader) std::array<std::byte, sizeof(Shader)> padded{};
+    std::memcpy(padded.data(), &copy, sizeof(Shader));
+    padded.back() = std::byte{0x7d};
+    AgcDriverResolveShaderAbi_nid_postfix(reinterpret_cast<Shader*>(padded.data()), {}, {});
+    copy.target ^= 1u;
+    ExpectFailure([&] { AgcDriverResolveShaderAbi_nid_postfix(&copy, {}, {}); }, "replaced shader header");
+    Header moved = header;
+    moved.shader.sh_registers = moved.registers.data();
+    moved.shader.cx_registers = moved.context.data();
+    moved.shader.specials = &moved.specials;
+    AgcDriverResolveShaderAbi_nid_postfix(&moved.shader, {}, {});
+    moved.shader.specials = &moved.specials + 1;
+    ExpectFailure([&] { AgcDriverResolveShaderAbi_nid_postfix(&moved.shader, {}, {}); }, "replaced shader header");
+    Shader identical = header.shader;
+    AgcDriverResolveShaderAbi_nid_postfix(&identical, {}, {});
+    Shader unmapped = header.shader;
+    unmapped.sh_registers = reinterpret_cast<ShaderRegister*>(0x12340000u);
+    ExpectFailure([&] { AgcDriverResolveShaderAbi_nid_postfix(&unmapped, {}, {}); }, "replaced shader header");
+    Shader wrongCode = header.shader;
+    wrongCode.code = reinterpret_cast<const void*>(0x12340000u);
+    ExpectFailure([&] { AgcDriverResolveShaderAbi_nid_postfix(&wrongCode, {}, {}); }, "unregistered shader");
+    // The game crash shape: registered WITH user data, bound WITHOUT.
+    header.shader.user_data = &header.users;
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+    Shader noUserData = header.shader;
+    noUserData.user_data = nullptr;
+    AgcDriverResolveShaderAbi_nid_postfix(&noUserData, {}, {});
+    header.shader.user_data = nullptr;
     header.registers[1].value |= 0x100u;
     ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&header.shader); }, "invalid registered program address");
     header.registers[1].value &= 0xffu;
