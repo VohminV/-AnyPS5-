@@ -12,6 +12,7 @@
 #endif
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
+#include "prx/libkernel/Socket/include/SocketPoll.hpp"
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -33,9 +34,13 @@ namespace {
 #ifdef _WIN32
 using NativeSocket = SOCKET;
 constexpr auto Invalid = INVALID_SOCKET;
+#include <fcntl.h>
+#include <io.h>
+#include <share.h>
 #else
 using NativeSocket = int;
 constexpr auto Invalid = -1;
+#include <fcntl.h>
 #endif
 int Fail(int error) { *__error_nid_postfix() = error; return -1; }
 constexpr int GuestNoSignal = 0x20000;
@@ -95,9 +100,10 @@ struct Socket {
     NativeSocket value;
     int family;
     int type;
+    int reserved;
     std::mutex modeMutex;
     bool nonblocking = false;
-    Socket(NativeSocket value, int family, int type) : value(value), family(family), type(type) {}
+    Socket(NativeSocket value, int family, int type, int reserved) : value(value), family(family), type(type), reserved(reserved) {}
     ~Socket() {
         if (value == Invalid) return;
 #ifdef _WIN32
@@ -105,11 +111,27 @@ struct Socket {
 #else
         ::close(value);
 #endif
+        if (reserved >= 0) {
+#ifdef _WIN32
+            ::_close(reserved);
+#else
+            ::close(reserved);
+#endif
+        }
     }
 };
 std::mutex socketsMutex;
 std::map<int, std::shared_ptr<Socket>> sockets;
-int nextDescriptor = GuestSockets::FirstDescriptor;
+int ReserveDescriptor() {
+#ifdef _WIN32
+    int reserved = -1;
+    if (_sopen_s(&reserved, "NUL", _O_RDONLY, _SH_DENYNO, 0) != 0) return -1;
+    return reserved;
+#else
+    const int reserved = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    return reserved;
+#endif
+}
 std::shared_ptr<Socket> Lookup(int descriptor) {
     std::lock_guard lock(socketsMutex);
     const auto found = sockets.find(descriptor);
@@ -175,10 +197,64 @@ int GuestSockets::Close(int descriptor) {
     return sockets.erase(descriptor) ? 0 : Fail(9);
 }
 
+// Poll the real OS socket behind a guest descriptor with a zero timeout.
+// Returns true when the descriptor is an open socket (revents is the ready
+// subset of events, possibly 0); false when it is not a socket at all.
+// Like the console (FreeBSD fd table shared by files and sockets), a guest
+// select() must observe real socket readiness, not the reserved placeholder.
+bool GuestSockets::QuerySocket(int descriptor, short events, short& revents) {
+    revents = 0;
+    std::shared_ptr<Socket> socket;
+    {
+        std::lock_guard lock(socketsMutex);
+        const auto found = sockets.find(descriptor);
+        if (found == sockets.end()) return false;
+        socket = found->second;
+    }
+#ifdef _WIN32
+    WSAPOLLFD watched{};
+    watched.fd = socket->value;
+    if (events & KernelSocketPoll::Readable) watched.events |= POLLRDNORM;
+    if (events & KernelSocketPoll::Urgent) watched.events |= POLLRDBAND;
+    if (events & KernelSocketPoll::Writable) watched.events |= POLLWRNORM;
+    if (WSAPoll(&watched, 1, 0) < 0) {
+        revents = KernelSocketPoll::Error;
+        return true;
+    }
+    const short native = watched.revents;
+    if (native & POLLRDNORM) revents |= KernelSocketPoll::Readable;
+    if (native & POLLRDBAND) revents |= KernelSocketPoll::Urgent;
+    if (native & POLLWRNORM) revents |= KernelSocketPoll::Writable;
+#else
+    pollfd watched{};
+    watched.fd = socket->value;
+    if (events & KernelSocketPoll::Readable) watched.events |= static_cast<short>(POLLIN);
+    if (events & KernelSocketPoll::Urgent) watched.events |= static_cast<short>(POLLPRI);
+    if (events & KernelSocketPoll::Writable) watched.events |= static_cast<short>(POLLOUT);
+    if (::poll(&watched, 1, 0) < 0) {
+        revents = KernelSocketPoll::Error;
+        return true;
+    }
+    if (watched.revents & POLLIN) revents |= KernelSocketPoll::Readable;
+    if (watched.revents & POLLPRI) revents |= KernelSocketPoll::Urgent;
+    if (watched.revents & POLLOUT) revents |= KernelSocketPoll::Writable;
+#endif
+    if (watched.revents & POLLERR) revents |= KernelSocketPoll::Error;
+#ifdef _WIN32
+    if (native & POLLHUP) revents |= KernelSocketPoll::HangUp;
+#else
+    if (watched.revents & POLLHUP) revents |= KernelSocketPoll::HangUp;
+#endif
+    if (watched.revents & POLLNVAL) revents |= KernelSocketPoll::Error;
+    return true;
+}
+
 bool GuestSockets::IsOpen(int descriptor) {
     std::lock_guard lock(socketsMutex);
     return sockets.contains(descriptor);
 }
+
+
 
 namespace {
 #ifdef _WIN32
@@ -273,15 +349,23 @@ int APS5_VABI socket_nid_postfix(int family, int type, int protocol) {
 #endif
     const auto native = ::socket(family == 2 ? AF_INET : AF_INET6, nativeType, protocol);
     if (native == Invalid) return Fail(NativeError());
-    Socket guard(native, family, type);
+    const int reserved = ReserveDescriptor();
+    if (reserved < 0) {
+#ifdef _WIN32
+        closesocket(native);
+#else
+        ::close(native);
+#endif
+        return Fail(24);
+    }
+    Socket guard(native, family, type, reserved);
     try {
-        auto socket = std::make_shared<Socket>(native, family, type);
+        auto socket = std::make_shared<Socket>(native, family, type, reserved);
         guard.value = Invalid;
+        guard.reserved = -1;
         std::lock_guard lock(socketsMutex);
-        if (nextDescriptor == INT_MAX) return Fail(24);
-        const int descriptor = nextDescriptor++;
-        sockets.emplace(descriptor, std::move(socket));
-        return descriptor;
+        sockets.emplace(reserved, std::move(socket));
+        return reserved;
     } catch (const std::bad_alloc&) {
         return Fail(12);
     }
@@ -310,16 +394,24 @@ int APS5_VABI accept_nid_postfix(int descriptor, void* address, std::uint32_t* l
     const auto native = ::accept(listener->value, address ? reinterpret_cast<sockaddr*>(&peer) : nullptr,
         address ? &size : nullptr);
     if (native == Invalid) return Fail(NativeError());
-    Socket guard(native, listener->family, listener->type);
+    const int reserved = ReserveDescriptor();
+    if (reserved < 0) {
+#ifdef _WIN32
+        closesocket(native);
+#else
+        ::close(native);
+#endif
+        return Fail(24);
+    }
+    Socket guard(native, listener->family, listener->type, reserved);
     try {
-        auto accepted = std::make_shared<Socket>(native, listener->family, listener->type);
+        auto accepted = std::make_shared<Socket>(native, listener->family, listener->type, reserved);
         guard.value = Invalid;
+        guard.reserved = -1;
         std::lock_guard lock(socketsMutex);
-        if (nextDescriptor == INT_MAX) return Fail(24);
-        const int acceptedDescriptor = nextDescriptor++;
-        sockets.emplace(acceptedDescriptor, std::move(accepted));
+        sockets.emplace(reserved, std::move(accepted));
         if (address) GuestAddress(peer, address, length);
-        return acceptedDescriptor;
+        return reserved;
     } catch (const std::bad_alloc&) {
         return Fail(12);
     }
@@ -536,8 +628,6 @@ int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t c
         if (entry.descriptor < 0) continue;
         if ((entry.events & ~GuestPollAccepted) != 0)
             throw std::runtime_error("poll: unsupported event flags " + std::to_string(entry.events));
-        if (entry.descriptor < GuestSockets::FirstDescriptor)
-            throw std::runtime_error("poll: descriptor " + std::to_string(entry.descriptor) + " is not a socket");
         auto socket = Find(entry.descriptor);
         if (!socket) {
             entry.revents = GuestPollInvalid;

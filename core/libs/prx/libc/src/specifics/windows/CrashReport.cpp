@@ -581,7 +581,18 @@ void AbortSignalHandler(int) {
     ReportBacktrace("abort() (SIGABRT)", true);
 }
 
-void InvalidParameterHandler(const wchar_t*, const wchar_t*, const wchar_t*, unsigned, std::uintptr_t) {
+void InvalidParameterHandler(const wchar_t* expression, const wchar_t* function, const wchar_t* file, unsigned line, std::uintptr_t) {
+    char narrow[3][512];
+    const char* parts[3] = {"?", "?", "?"};
+    const wchar_t* wides[3] = {expression, function, file};
+    for (int i = 0; i < 3; ++i) {
+        if (wides[i] && *wides[i]) {
+            WideCharToMultiByte(CP_UTF8, 0, wides[i], -1, narrow[i], sizeof(narrow[i]), nullptr, nullptr);
+            narrow[i][sizeof(narrow[i]) - 1] = 0;
+            parts[i] = narrow[i];
+        }
+    }
+    Report("UCRT invalid parameter: %s in %s (%s:%u)\n", parts[0], parts[1], parts[2], line);
     ReportBacktrace("UCRT invalid parameter", true);
 }
 

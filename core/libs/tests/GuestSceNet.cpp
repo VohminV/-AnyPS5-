@@ -261,6 +261,7 @@ int main() {
     const int udp_receiver = sceNetSocket(nullptr, 2, 2, 17);
     const int udp_sender = sceNetSocket(nullptr, 2, 2, 17);
     Require(udp_receiver >= 0 && udp_sender >= 0);
+    Require(udp_receiver < 1024 && udp_sender < 1024 && udp_receiver != udp_sender);
     address = {16, 2, 0, 0, 127, 0, 0, 1};
     Require(sceNetBind_nid_postfix(udp_receiver, address.data(), address.size()) == 0);
     address_size = address.size();

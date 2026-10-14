@@ -99,7 +99,8 @@ static int NativeFlock(int descriptor, int operation) {
 }
 static std::int64_t NativePositioned(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write) {
     if (nbytes > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
-        throw std::runtime_error("NativePositioned: nbytes exceeds platform limit");
+        errno = EINVAL;
+        return -1;
     }
     const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
     if (handle == INVALID_HANDLE_VALUE) {
@@ -119,7 +120,8 @@ static std::int64_t NativePositioned(int descriptor, void* buf, std::size_t nbyt
                           : ::ReadFile(handle, buf, static_cast<DWORD>(nbytes), &done, &overlapped);
     const DWORD error = ok ? ERROR_SUCCESS : ::GetLastError();
     if (!::SetFilePointerEx(handle, position, nullptr, FILE_BEGIN)) {
-        throw std::runtime_error("NativePositioned: cannot restore the file offset");
+        errno = EIO;
+        return -1;
     }
     if (!ok) {
         if (!write && error == ERROR_HANDLE_EOF) return 0;
@@ -130,7 +132,8 @@ static std::int64_t NativePositioned(int descriptor, void* buf, std::size_t nbyt
 }
 static std::int64_t NativeTransfer(int descriptor, void* buf, std::size_t nbytes, bool write) {
     if (nbytes > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-        throw std::runtime_error("NativeTransfer: nbytes exceeds platform limit");
+        errno = EINVAL;
+        return -1;
     }
     return write ? ::_write(descriptor, buf, static_cast<unsigned int>(nbytes)) : ::_read(descriptor, buf, static_cast<unsigned int>(nbytes));
 }
@@ -255,7 +258,7 @@ int APS5_VABI chmod_nid_postfix(const char* path, int mode) {
 }
 
 int APS5_VABI close_nid_postfix(int d) {
-    if (d >= GuestSockets::FirstDescriptor) return GuestSockets::Close(d);
+    if (GuestSockets::IsOpen(d)) return GuestSockets::Close(d);
 #ifdef _WIN32
     File::ForgetDirectoryDescriptor(d);
     return _close(d);
@@ -346,31 +349,37 @@ int APS5_VABI _open_nid_postfix(const char* path, int flags, ...) {
 }
 
 int64_t APS5_VABI pread_nid_postfix(int d, void* buf, size_t nbytes, int64_t offset) {
-    if (buf == nullptr) {
-        APS5_INVALID_ARG_EX;
+    if (buf == nullptr && nbytes != 0) {
+        return SceErrorFromErrno(GUEST_EFAULT);
     }
     if (offset < 0) {
-        APS5_INVALID_ARG_EX;
+        return SceErrorFromErrno(GUEST_EINVAL);
+    }
+    if (GuestSockets::IsOpen(d)) {
+        return SceErrorFromErrno(GUEST_EBADF);
     }
     const GuestArena::HostWrite destination(buf, nbytes);
-    if (!destination.Open()) errno = EFAULT;
-    auto n = destination.Open() ? NativePread(d, buf, nbytes, offset) : -1;
+    if (!destination.Open()) return SceErrorFromErrno(GUEST_EFAULT);
+    auto n = NativePread(d, buf, nbytes, offset);
     if (n < 0) {
-        throw std::runtime_error(std::string(__func__) + ": pread failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
+        return SceErrorFromErrno(errno);
     }
     return n;
 }
 
 int64_t APS5_VABI pwrite_nid_disambig1_nid_postfix(int d, const void* buf, size_t nbytes, int64_t offset) {
-    if (buf == nullptr) {
-        APS5_INVALID_ARG_EX;
+    if (buf == nullptr && nbytes != 0) {
+        return SceErrorFromErrno(GUEST_EFAULT);
     }
     if (offset < 0) {
-        APS5_INVALID_ARG_EX;
+        return SceErrorFromErrno(GUEST_EINVAL);
+    }
+    if (GuestSockets::IsOpen(d)) {
+        return SceErrorFromErrno(GUEST_EBADF);
     }
     auto n = NativePwrite(d, buf, nbytes, offset);
     if (n < 0) {
-        throw std::runtime_error(std::string(__func__) + ": pwrite failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
+        return SceErrorFromErrno(errno);
     }
     return n;
 }
@@ -668,7 +677,7 @@ int APS5_VABI sceKernelChmod_nid_postfix(const char* path, std::uint16_t mode) {
 }
 
 int APS5_VABI sceKernelFchmod(int d, std::uint16_t mode) {
-    if (d >= GuestSockets::FirstDescriptor) return SceErrorFromErrno(GuestSockets::IsOpen(d) ? GUEST_EINVAL : GUEST_EBADF);
+    if (GuestSockets::IsOpen(d)) return SceErrorFromErrno(GUEST_EINVAL);
     if (NativeFchmod(d, mode & 07777) != 0) return SceErrorFromErrno(errno);
     return 0;
 }
@@ -702,7 +711,7 @@ int APS5_VABI utimes_nid_postfix(const char* path, const KernelTimeval* times) {
 }
 
 int APS5_VABI futimes_nid_postfix(int d, const KernelTimeval* times) {
-    if (d >= GuestSockets::FirstDescriptor) return PosixFailure(GuestSockets::IsOpen(d) ? GUEST_EINVAL : GUEST_EBADF);
+    if (GuestSockets::IsOpen(d)) return PosixFailure(GUEST_EINVAL);
     if (times != nullptr) {
         for (int i = 0; i < 2; ++i) {
             if (times[i].tv_usec < 0 || times[i].tv_usec >= 1000000) return PosixFailure(GUEST_EINVAL);

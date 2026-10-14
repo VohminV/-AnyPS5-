@@ -73,6 +73,12 @@ int main() {
     std::tm utc{}, local{};
     Require(gmtime_s_nid_postfix(&epoch, &utc) == &utc && utc.tm_year == 70 && utc.tm_mon == 0
         && utc.tm_mday == 1 && utc.tm_hour == 0, "UTC epoch conversion failed");
+    const std::int64_t negative = -1;
+    const std::int64_t pastLimit = 253402214401;
+    Require(gmtime_s_nid_postfix(&negative, &utc) == nullptr, "Negative time was accepted");
+    Require(gmtime_s_nid_postfix(&pastLimit, &utc) == nullptr, "Out-of-range future time was accepted");
+    Require(localtime_s_nid_postfix(&negative, &local) == nullptr, "Negative local time was accepted");
+    Require(localtime_s_nid_postfix(&pastLimit, &local) == nullptr, "Out-of-range future local time was accepted");
     Require(localtime_s_nid_postfix(&epoch, &local) == &local && local.tm_year == 70 && local.tm_mon == 0
         && local.tm_mday == 1 && local.tm_hour == 2, "Local epoch conversion failed");
     CheckConcurrent(libc_gmtime_nid_postfix, gmtime_s_nid_postfix, "Concurrent libc_gmtime returned another thread's date");

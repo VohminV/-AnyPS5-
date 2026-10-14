@@ -61,6 +61,9 @@ std::tm* APS5_VABI localtime_nid_postfix(const int64_t* timer) {
 
 std::tm* APS5_VABI localtime_s_nid_postfix(const int64_t* timer, std::tm* result) {
     if (timer == nullptr || result == nullptr) return nullptr;
+    // Out-of-range values make the host CRT abort the process through the
+    // invalid-parameter handler; report them as unrepresentable instead.
+    if (*timer < 0 || *timer > 253402214400) return nullptr;
     const std::time_t t = static_cast<std::time_t>(*timer);
 #ifdef _WIN32
     if (localtime_s(result, &t) != 0) return nullptr;
@@ -72,6 +75,7 @@ std::tm* APS5_VABI localtime_s_nid_postfix(const int64_t* timer, std::tm* result
 
 std::tm* APS5_VABI gmtime_s_nid_postfix(const int64_t* timer, std::tm* result) {
     if (timer == nullptr || result == nullptr) return nullptr;
+    if (*timer < 0 || *timer > 253402214400) return nullptr;
     const std::time_t t = static_cast<std::time_t>(*timer);
 #ifdef _WIN32
     if (gmtime_s(result, &t) != 0) return nullptr;

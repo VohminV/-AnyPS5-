@@ -857,6 +857,7 @@ void Driver::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::
                         static_cast<unsigned long long>(address),
                         static_cast<unsigned long long>(snapshot->headerAddress),
                         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(shader)));
+
                     require(false, detail);
                 }
             }

@@ -33,6 +33,7 @@ int APS5_VABI rmdir_nid_postfix(const char*);
 int APS5_VABI mkdir_nid_postfix(const char*, unsigned short);
 int APS5_VABI sceKernelOpen(const char*, int, unsigned short);
 int APS5_VABI sceKernelClose(int);
+int APS5_VABI sceKernelRead(int, void*, std::size_t);
 int APS5_VABI sceKernelStat(const char*, FileStat*);
 int APS5_VABI sceKernelUnlink(const char*);
 int APS5_VABI sceKernelRmdir(const char*);
@@ -40,6 +41,7 @@ int* APS5_VABI __error_nid_postfix();
 int APS5_VABI pipe_nid_postfix(int*);
 std::int64_t APS5_VABI read_nid_postfix(int, void*, std::size_t);
 std::int64_t APS5_VABI write_nid_postfix(int, const void*, std::size_t);
+int APS5_VABI select_nid_postfix(int, void*, void*, void*, const void*);
 int APS5_VABI sceKernelDebugOutText(int, const char*);
 }
 static void Check(bool value, int line) {
@@ -87,6 +89,18 @@ int main() {
     Require(std::memcmp(received, payload, sizeof(payload)) == 0);
     Require(read_nid_postfix(descriptors[0], received, sizeof(received)) == 0);
     Require(close_nid_postfix(descriptors[0]) == 0);
+    int wave[2] = {-1, -1};
+    Require(pipe_nid_postfix(wave) == 0);
+    const std::int64_t pollNow[2]{0, 0};
+    std::uint64_t readSet[16]{}, writeSet[16]{};
+    readSet[wave[0] / 64] |= std::uint64_t{1} << (wave[0] % 64);
+    writeSet[wave[1] / 64] |= std::uint64_t{1} << (wave[1] % 64);
+    Require(select_nid_postfix(wave[1] + 1, readSet, writeSet, nullptr, pollNow) == 1);
+    Require((readSet[wave[0] / 64] & (std::uint64_t{1} << (wave[0] % 64))) == 0);
+    Require(write_nid_postfix(wave[1], payload, 1) == 1);
+    readSet[wave[0] / 64] |= std::uint64_t{1} << (wave[0] % 64);
+    Require(select_nid_postfix(wave[1] + 1, readSet, writeSet, nullptr, pollNow) == 2);
+    Require(close_nid_postfix(wave[0]) == 0 && close_nid_postfix(wave[1]) == 0);
     const auto root = std::filesystem::path("anyps5-filesystem-test-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     Require(mkdir_nid_postfix(root.string().c_str(), 0700) == 0);
@@ -203,6 +217,15 @@ int main() {
     Require(sceKernelClose(closable) == static_cast<int>(0x80020009u));
     Require(sceKernelClose(-1) == static_cast<int>(0x80020009u));
     Require(unlink_nid_postfix(presentName.c_str()) == 0 && !std::filesystem::exists(present));
+    for (const char* device : {"/dev/urandom", "/dev/random"}) {
+        const int random = sceKernelOpen(device, 0, 0);
+        Require(random >= 0);
+        unsigned char first[64]{}, second[64]{};
+        Require(sceKernelRead(random, first, sizeof(first)) == static_cast<int>(sizeof(first)));
+        Require(sceKernelRead(random, second, sizeof(second)) == static_cast<int>(sizeof(second)));
+        Require(std::memcmp(first, second, sizeof(first)) != 0);
+        Require(sceKernelClose(random) == 0);
+    }
     const auto empty = root / "empty";
     Require(std::filesystem::create_directory(empty));
     Require(rmdir_nid_postfix(empty.string().c_str()) == 0 && !std::filesystem::exists(empty));
