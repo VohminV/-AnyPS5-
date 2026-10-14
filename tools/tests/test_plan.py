@@ -122,17 +122,22 @@ class PlanTests(unittest.TestCase):
     def test_runtime_gates_do_not_block_preparation(self):
         # No libs dir and real Vulkan state: RUNTIME_START is the first
         # blocked stage, but CONVERT_SELF/RELINK stay executable.
+        # An empty build dir keeps this hermetic wherever real libs exist.
         game = self.root / "selfgame3"
         (game / "sce_module").mkdir(parents=True)
         (game / "eboot.bin").write_bytes(bytes([0x4F, 0x15, 0x3D, 0x1D]) + bytes(0x100))
         (game / "sce_module" / "mod.prx").write_bytes(build_elf())
         inspector = self.root / "self_inspector-fake2"
         inspector.write_bytes(b"x")
+        empty_build = self.root / "emptybuild"
+        empty_build.mkdir()
         with patch.object(preflight_mod, "find_self_inspector",
-                          return_value=str(inspector)):
+                          return_value=str(inspector)), \
+             patch.object(preflight_mod, "check_libs",
+                          return_value={"ready": False, "dir": "", "count": 0}):
             built, blocked = plan.build_plan(
                 target="linux", game_dir=str(game), input_path=str(game / "eboot.bin"),
-                relinker_path=str(self.relinker))
+                relinker_path=str(self.relinker), build_dir=str(empty_build))
         self.assertIsNotNone(blocked)
         self.assertEqual(blocked["stage"], "RUNTIME_START")
         convert = next(s for s in built["stages"] if s["name"] == "CONVERT_SELF")

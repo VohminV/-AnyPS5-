@@ -96,7 +96,7 @@ python tools/plan.py --target windows --game-dir "D:\Games\MyGame" --run
 ## 6. Проверки
 
 ```sh
-python -m unittest tools.tests.test_inspect_executable tools.tests.test_preflight tools.tests.test_capabilities tools.tests.test_plan tools.tests.test_vulkan_check
+python -m unittest tools.tests.test_inspect_executable tools.tests.test_preflight tools.tests.test_capabilities tools.tests.test_plan tools.tests.test_vulkan_check tools.tests.test_run_game
 python -m unittest tools.tests.test_import_audit tools.tests.test_progress
 ctest --test-dir build-relinker --output-on-failure
 ```

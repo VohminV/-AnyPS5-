@@ -4,6 +4,13 @@
 
 Use a clean ELF executable. Place its bundled ELF modules in `sce_module/`, `sce_modules/`, or `prx/` beside the input executable. `prx/` can coexist with either `sce_module/` or `sce_modules/`. Both `sce_module/` and `sce_modules/` present, or all three absent, is an error.
 
+A needed module name also matches a bundled file with the same stem plus a
+`-variant` suffix, ignoring case (`kitt_support.prx` finds
+`kitt_support-ps5-shipping.prx`; `EOSSDK-PS5-Shipping.debug_prx` finds
+`eossdk-ps5-shipping.prx`). Exact and case-folded matches win; several
+candidates are an error, never a guess. A pure case difference with the same
+extension is not an alias: case sensitivity belongs to the OS loader.
+
 ```text
 source/
     input.elf

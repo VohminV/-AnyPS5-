@@ -9,10 +9,39 @@
 #include <iostream>
 #include <limits>
 #include <set>
+#include <string>
+#include <vector>
 
 namespace Relinker {
 
 namespace {
+
+std::string FoldAsciiLower(std::string name) {
+    for (auto& character : name) {
+        if (character >= 'A' && character <= 'Z') character = static_cast<char>(character + ('a' - 'A'));
+    }
+    return name;
+}
+
+// Dumps (notably Unreal Engine titles) ship `<stem>-<variant>.prx` files
+// while DT_NEEDED names the short `<stem>.prx` (or `<stem>.debug_prx`) form.
+// This alias matches those spellings conservatively: exact and
+// case-folded lookups always win, and several candidates are an error,
+// never a guess. A pure case difference with the same extension is NOT an
+// alias: case sensitivity belongs to the OS loader (Windows folds,
+// Linux does not).
+bool StemAliasEqual(const std::string& needed, const std::string& candidate) {
+    const auto split = [](const std::string& name) {
+        const auto dot = name.rfind('.');
+        const auto stem = (dot == std::string::npos) ? name : name.substr(0, dot);
+        const auto ext = (dot == std::string::npos) ? std::string{} : name.substr(dot + 1);
+        return std::pair{ FoldAsciiLower(stem), FoldAsciiLower(ext) };
+    };
+    const auto [needStem, needExt] = split(needed);
+    const auto [candStem, candExt] = split(candidate);
+    if (needExt != candExt) return candStem == needStem || candStem.starts_with(needStem + "-");
+    return candStem.starts_with(needStem + "-");
+}
 
 std::vector<std::string> ReadNeededNames(const Domain::SysVDynamicSection& dynamic) {
     if (dynamic.DynamicSegmentData.size() % 16 != 0) throw Domain::RelinkerException("Invalid executable dependency table");
@@ -84,7 +113,10 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     std::set<std::string> missingNeeded;
     for (const auto& name : neededNames) {
         if (excludedModules.contains(name)) continue;
-        if (std::none_of(paths.begin(), paths.end(), [&](const auto& path) { return path.filename().string() == name; })) missingNeeded.insert(name);
+        if (std::none_of(paths.begin(), paths.end(), [&](const auto& path) {
+                const auto file = path.filename().string();
+                return file == name || StemAliasEqual(name, file);
+            })) missingNeeded.insert(name);
     }
     if (!missingNeeded.empty()) {
         std::map<std::string, std::filesystem::path> found;
@@ -94,8 +126,18 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 continue;
             }
             const auto name = it->path().filename().string();
-            if (!it->is_regular_file() || !missingNeeded.contains(name) || !isElf(it->path())) continue;
-            if (!found.emplace(name, it->path()).second) throw Domain::RelinkerException("Ambiguous needed module: " + found.at(name).string() + " and " + it->path().string());
+            if (!it->is_regular_file() || !isElf(it->path())) continue;
+            std::string matched;
+            if (missingNeeded.contains(name)) matched = name;
+            else {
+                for (const auto& miss : missingNeeded) {
+                    if (!StemAliasEqual(miss, name)) continue;
+                    if (!matched.empty()) throw Domain::RelinkerException("Ambiguous needed module: " + found.at(matched).string() + " and " + it->path().string());
+                    matched = miss;
+                }
+            }
+            if (matched.empty()) continue;
+            if (!found.emplace(matched, it->path()).second) throw Domain::RelinkerException("Ambiguous needed module: " + found.at(matched).string() + " and " + it->path().string());
         }
         for (const auto& [name, path] : found) paths.push_back(path);
     }
@@ -156,9 +198,23 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     }
     const auto findGuest = [&](const std::string& name) {
         const auto exact = guestNames.find(name);
-        if (exact != guestNames.end() || !windows) return exact;
-        const auto file = windowsGuestFiles.find(foldFilename(name));
-        return file == windowsGuestFiles.end() ? guestNames.end() : guestNames.emplace(name, file->second).first;
+        if (exact != guestNames.end()) return exact;
+        if (windows) {
+            const auto file = windowsGuestFiles.find(foldFilename(name));
+            if (file != windowsGuestFiles.end()) return guestNames.emplace(name, file->second).first;
+        }
+        // Dumps (notably Unreal Engine titles) ship `<stem>-<variant>.prx`
+        // files while DT_NEEDED names the short `<stem>.prx` form. Accept
+        // that spelling only when a single guest file matches; several
+        // candidates are an error, never a guess.
+        std::vector<std::size_t> aliases;
+        for (std::size_t index = 0; index < images.size(); ++index) {
+            if (!StemAliasEqual(name, images[index].SourcePath.filename().string())) continue;
+            if (std::find(aliases.begin(), aliases.end(), index) == aliases.end()) aliases.push_back(index);
+        }
+        if (aliases.size() > 1) throw Domain::RelinkerException("Ambiguous guest dependency name: " + name);
+        if (aliases.empty()) return guestNames.end();
+        return guestNames.emplace(name, aliases.front()).first;
     };
     const auto rejectSharedImport = [&](const std::string& name, const std::string& importer) {
         const auto shared = sharedExports.find(name);

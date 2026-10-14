@@ -51,6 +51,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_plan.py)
         add_test(NAME vulkan_check COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_check.py)
+        add_test(NAME run_game COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_run_game.py)
     endif()
 endif()
 

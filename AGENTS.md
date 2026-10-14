@@ -88,5 +88,5 @@ cmake --build build --target libSceAgcDriver --config Release -j 8
 ctest --test-dir build -R "agc_write_tracking|agc_driver_graphics|agc_dcc_key_sharing|agc_display_buffer_dcc|agc_draw_snapshot_reuse" --output-on-failure
 
 # Python tool tests (no build needed)
-python -m unittest tools.tests.test_inspect_executable tools.tests.test_preflight tools.tests.test_capabilities tools.tests.test_plan tools.tests.test_vulkan_check
+python -m unittest tools.tests.test_inspect_executable tools.tests.test_preflight tools.tests.test_capabilities tools.tests.test_plan tools.tests.test_vulkan_check tools.tests.test_run_game
 ```

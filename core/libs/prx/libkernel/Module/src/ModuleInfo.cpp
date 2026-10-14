@@ -8,7 +8,9 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #include <link.h>
 #include <unistd.h>
@@ -18,11 +20,18 @@ extern "C" std::int32_t ModuleIdForImage_nid_no_patch(const void* native);
 
 namespace {
 
-#ifndef _WIN32
 constexpr char GuestModuleSuffix[] = ".guest.prx";
 constexpr std::int32_t ProtRead = 1;
 constexpr std::int32_t ProtWrite = 2;
 constexpr std::int32_t ProtExecute = 4;
+
+std::uint32_t ToU32(std::uint64_t value, const char* field) {
+    if (value > std::numeric_limits<std::uint32_t>::max())
+        throw std::runtime_error(std::string("sceKernelGetModuleInfoFromAddr: ") + field + " exceeds 32 bits");
+    return static_cast<std::uint32_t>(value);
+}
+
+#ifndef _WIN32
 
 struct ImageSearch {
     std::uintptr_t address;
@@ -38,12 +47,6 @@ bool Contains(const dl_phdr_info& image, std::uintptr_t begin, std::uint64_t siz
         if (begin >= start && begin - start <= header.p_memsz && size <= header.p_memsz - (begin - start)) return true;
     }
     return false;
-}
-
-std::uint32_t ToU32(std::uint64_t value, const char* field) {
-    if (value > std::numeric_limits<std::uint32_t>::max())
-        throw std::runtime_error(std::string("sceKernelGetModuleInfoFromAddr: ") + field + " exceeds 32 bits");
-    return static_cast<std::uint32_t>(value);
 }
 
 std::uintptr_t EhFrameAddress(const dl_phdr_info& image, std::uintptr_t header) {
@@ -164,8 +167,83 @@ int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, M
     if (info->st_size != sizeof(ModuleInfoEx))
         throw std::invalid_argument("sceKernelGetModuleInfoFromAddr: unsupported st_size " + std::to_string(info->st_size));
 #ifdef _WIN32
-    (void)address;
-    NotImplemented_nid_no_patch(__func__);
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(address), &module))
+        return SCE_KERNEL_ERROR_ESRCH;
+    ModuleInfoEx result{};
+    result.st_size = sizeof(ModuleInfoEx);
+    char filename[4096];
+    const auto length = GetModuleFileNameA(module, filename, sizeof(filename));
+    if (length == 0 || length >= sizeof(filename))
+        throw std::runtime_error("sceKernelGetModuleInfoFromAddr: cannot resolve the module path");
+    std::string name = filename + (std::string(filename, filename + length).find_last_of("/\\") + 1);
+    constexpr std::string_view suffix = ".guest.prx";
+    if (name.size() > suffix.size() && name.ends_with(suffix)) name.resize(name.size() - suffix.size());
+    if (name.size() >= sizeof(result.name))
+        throw std::runtime_error("sceKernelGetModuleInfoFromAddr: module name too long: " + name);
+    std::memcpy(result.name, name.c_str(), name.size() + 1);
+    result.id = ModuleIdForImage_nid_no_patch(module);
+    const auto* image = reinterpret_cast<const std::uint8_t*>(module);
+    std::uint32_t imageSize = 0;
+    std::uint32_t tlsRva = 0;
+    {
+        std::uint32_t peOffset = 0;
+        std::memcpy(&peOffset, image + 0x3C, sizeof(peOffset));
+        std::uint32_t signature = 0;
+        std::memcpy(&signature, image + peOffset, sizeof(signature));
+        std::uint16_t magic = 0;
+        std::memcpy(&magic, image + peOffset + 24, sizeof(magic));
+        std::uint16_t directoryCount = 0;
+        // Optional header: magic(2) + linker(2) + 4*9 + ... + NumberOfRvaAndSizes at +108 (PE32+).
+        if (std::memcmp(image, "MZ", 2) != 0 || signature != 0x4550 || magic != 0x20B)
+            throw std::runtime_error("sceKernelGetModuleInfoFromAddr: unsupported image format");
+        std::memcpy(&imageSize, image + peOffset + 24 + 56, sizeof(imageSize));
+        std::memcpy(&directoryCount, image + peOffset + 24 + 108, sizeof(directoryCount));
+        // A data directory is VirtualAddress(u32) + Size(u32); only the address part locates the TLS template.
+        if (directoryCount > 9) std::memcpy(&tlsRva, image + peOffset + 24 + 112 + 72, sizeof(tlsRva));
+    }
+    const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(module);
+    const std::uintptr_t end = base + imageSize;
+    MEMORY_BASIC_INFORMATION region{};
+    for (std::uintptr_t cursor = base; cursor < end;) {
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &region, sizeof(region)) != sizeof(region) ||
+            region.State != MEM_COMMIT || region.RegionSize == 0)
+            break;
+        std::int32_t prot = 0;
+        switch (region.Protect & 0xFF) {
+        case PAGE_NOACCESS: prot = 0; break;
+        case PAGE_READONLY: prot = ProtRead; break;
+        case PAGE_READWRITE: case PAGE_WRITECOPY: prot = ProtRead | ProtWrite; break;
+        case PAGE_EXECUTE: prot = ProtExecute; break;
+        case PAGE_EXECUTE_READ: prot = ProtRead | ProtExecute; break;
+        case PAGE_EXECUTE_READWRITE: case PAGE_EXECUTE_WRITECOPY: prot = ProtRead | ProtWrite | ProtExecute; break;
+        default: prot = ProtRead; break;
+        }
+        if (result.segment_count < std::size(result.segments)) {
+            auto& segment = result.segments[result.segment_count++];
+            segment.address = reinterpret_cast<std::uint64_t>(region.BaseAddress);
+            segment.size = ToU32(region.RegionSize, "segment size");
+            segment.prot = prot;
+        }
+        if (region.RegionSize > end - cursor) break;
+        cursor = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+    }
+    if (result.segment_count == 0) return SCE_KERNEL_ERROR_ESRCH;
+    if (tlsRva != 0) {
+        const std::uintptr_t tls = base + tlsRva;
+        std::uint32_t rawStart = 0, rawEnd = 0, zeroFill = 0, alignment = 0;
+        std::memcpy(&rawStart, reinterpret_cast<const void*>(tls), sizeof(rawStart));
+        std::memcpy(&rawEnd, reinterpret_cast<const void*>(tls + 4), sizeof(rawEnd));
+        std::memcpy(&zeroFill, reinterpret_cast<const void*>(tls + 16), sizeof(zeroFill));
+        std::memcpy(&alignment, reinterpret_cast<const void*>(tls + 20), sizeof(alignment));
+        result.tls_init_addr = base + rawStart;
+        result.tls_init_size = ToU32(rawEnd - rawStart, "TLS image size");
+        result.tls_size = ToU32(rawEnd - rawStart + zeroFill, "TLS size");
+        result.tls_align = alignment != 0 ? alignment : 1;
+    }
+    result.ref_count = 1;
+    *info = result;
     return 0;
 #else
     Dl_info symbol{};
