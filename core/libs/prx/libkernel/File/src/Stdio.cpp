@@ -70,8 +70,15 @@ static int NativeFchmod(int descriptor, int mode) {
     const auto path = NativeDescriptorPath(descriptor);
     return path ? NativeChmod(*path, mode) : -1;
 }
+extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+static void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
 static int NativeFtruncate(int descriptor, std::int64_t length) {
-    return static_cast<int>(::_chsize_s(descriptor, length));
+    // A bad guest fd is routine (best-effort engine file ops): keep UCRT from
+    // filing its noisy invalid-parameter report, the errno result is enough.
+    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
+    const int result = static_cast<int>(::_chsize_s(descriptor, length));
+    _set_thread_local_invalid_parameter_handler(previous);
+    return result;
 }
 static int NativeUtimes(const std::filesystem::path& path, const KernelTimeval* times) {
     RecordWrittenPath_nid_no_patch(path);
@@ -295,13 +302,13 @@ int APS5_VABI ftruncate_nid_postfix(int d, int64_t length) {
         APS5_INVALID_ARG_EX;
     }
 #ifdef _WIN32
-    int error = NativeFtruncate(d, length);
+    const int error = NativeFtruncate(d, length);
     if (error != 0) {
-        throw std::runtime_error(std::string(__func__) + ": ftruncate failed, fd=" + std::to_string(d) + ", error=" + std::to_string(error));
+        return PosixFailure(error);
     }
 #else
     if (NativeFtruncate(d, length) != 0) {
-        throw std::runtime_error(std::string(__func__) + ": ftruncate failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
+        return PosixFailure(errno);
     }
 #endif
     return 0;

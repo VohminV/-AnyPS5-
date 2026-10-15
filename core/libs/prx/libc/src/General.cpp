@@ -89,6 +89,24 @@ std::filesystem::path ResolveHostPath(std::filesystem::path root, const std::fil
     return root;
 }
 
+// System mounts that always exist on hardware, so no mount call is needed:
+// make sure the host backing root is present for raw-path users (e.g. mod.io
+// under /download0). Only the root itself is created, once per process —
+// nested parents stay the title's own mkdir job, exactly like on the console.
+void EnsureSystemRoot(const std::filesystem::path& root, const std::string& relative) {
+    static std::once_flag download0;
+    const std::string head(relative.substr(0, relative.find('/')));
+    if (!SameName(head, "download0")) return;
+    std::call_once(download0, [&] {
+        std::error_code error;
+        if (std::filesystem::exists(root / "download0", error)) return;
+        for (std::filesystem::directory_iterator entry(root, error), end; !error && entry != end; entry.increment(error)) {
+            if (SameName(entry->path().filename().string(), "download0")) return;
+        }
+        std::filesystem::create_directories(root / "download0", error);
+    });
+}
+
 std::optional<std::filesystem::path> ResolveAlias(const std::string& guestPath) {
     const auto relative = TrimSlashes(guestPath.c_str());
     auto& aliases = Aliases();
@@ -123,6 +141,7 @@ std::filesystem::path Resolve(WorkingDirectory& state, const char* path) {
     auto guest = (std::filesystem::path("/") / state.current.lexically_relative(state.root));
     guest = (input.is_absolute() ? input : guest / input).lexically_normal();
     if (auto aliased = ResolveAlias(guest.relative_path().generic_string())) return *aliased;
+    EnsureSystemRoot(state.root, guest.relative_path().generic_string());
     return ResolveHostPath(state.root, guest.relative_path()).make_preferred();
 }
 struct WrittenPathRegistry {

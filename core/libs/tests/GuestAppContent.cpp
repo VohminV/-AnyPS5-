@@ -47,6 +47,18 @@ int main() {
     Require(sceAppContentDownloadDataGetAvailableSpaceKb(&download, &availableKb) == 0);
     Require(availableKb == 0);
     Require(sceAppContentDownloadDataGetAvailableSpaceKb(&download, nullptr) == ErrorParameter);
+    Require(!std::filesystem::exists(directory / "download0"));
+    const std::filesystem::path settings =
+        ResolvePath_nid_no_patch("/download0/mod.io/6086/Stalker_CS/../../globalsettings.json");
+    Require(std::filesystem::exists(directory / "download0"));
+    Require(!std::filesystem::exists(settings));
+    Require(std::filesystem::create_directories(settings.parent_path()));
+    {
+        std::ofstream settingsFile(settings, std::ios::binary);
+        settingsFile << "settings";
+        Require(static_cast<bool>(settingsFile));
+    }
+    Require(std::filesystem::exists(settings));
 
     const int32_t expectedParams[] = {3, 23566, -7, 0, 2147483647};
     for (uint32_t id = 0; id < 5; ++id) {

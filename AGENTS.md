@@ -85,13 +85,14 @@ When implementing new features or fixes:
 - Analysis: OS-level owner guard cannot see in-game TLSF free/realloc inside the same mapped arena; gen==0 (untracked) write-watch stamps stay silent on free-list pop (reads before writes), so stale GPU results were stored over the new owner's live bytes
 - Fix: `streamingTextureMutex` is now `recursive_mutex`, held ONLY for the gen==0 fast-path check (never across FlushPending/GPU waits), skipped when GpuMutex is held (avoids streaming->Gpu vs Gpu->streaming inversion); plus TLSF-reuse guard in `writeBackLayers`: for gen==0 compare guest vs `original` snapshot before storing, drop on mismatch
 - Kill switch: `APS5_NO_REFRESH_FAST_PATH=1` disables fast path AND streaming mutex (reuse guard also gated by `unregisteredDrop`)
-- Ship patched libs: per-game persistent store is `lib/<GAMEID>/` in this repo
-  (e.g. `lib/PPSA21733/`, patched `.prx` set). Upstream source is
-  `build/core/libs/libs/*.prx` (NOT `unpatched/`); refresh `lib/<GAMEID>/`
-  whenever libs are rebuilt. After any relink/rebuild, restore the game's
-  `libs/` from `lib/<GAMEID>/` and verify the file count — a missing/short
-  `libs/` causes Windows LoadLibrary error 126 at launch. MinGW-built libs
-  additionally need `libstdc++-6.dll` reachable (beside `app.exe` or on PATH).
+- Ship patched libs: no built `.prx` binaries are stored in this repo
+  (copyright caution — libs are build artifacts only). Rebuild with the
+  `libs` target (NID patcher); the upstream source is
+  `build/core/libs/libs/*.prx` (NOT `unpatched/`). After any relink/rebuild,
+  copy the game's `libs/` from there and verify the file count — a
+  missing/short `libs/` causes Windows LoadLibrary error 126 at launch.
+  MinGW-built libs additionally need `libstdc++-6.dll` reachable
+  (beside `app.exe` or on PATH).
 
 ### Build Commands
 ```bash

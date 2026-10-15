@@ -22,6 +22,7 @@ int APS5_VABI socket_nid_postfix(int, int, int);
 int APS5_VABI sceKernelFsync(int);
 int APS5_VABI sceKernelWriteThrottlingStatus(std::uint64_t*);
 int APS5_VABI sceKernelFtruncate(int, long long);
+int APS5_VABI ftruncate_nid_postfix(int, long long);
 int APS5_VABI sceKernelTruncate_nid_postfix(const char*, long long);
 int APS5_VABI sceKernelUtimes_nid_postfix(const char*, const void*);
 int APS5_VABI open_nid_postfix(const char*, int, int);
@@ -151,6 +152,9 @@ int main() {
     Require(sceKernelFchmod(descriptor, 0400) == 0 && !ownerWrite());
     Require(fchmod_nid_postfix(descriptor, 0600) == 0 && ownerWrite());
     Require(sceKernelFtruncate(descriptor, 3) == 0);
+    Require(ftruncate_nid_postfix(-1, 0) == -1 && *__error_nid_postfix() == 9);
+    Require(ftruncate_nid_postfix(0x180c3671, 0) == -1 && *__error_nid_postfix() == 9);
+    Require(sceKernelFtruncate(-1, 0) == -1 && *__error_nid_postfix() == 9);
     FileStat times{};
     const KernelTimeval past[2]{{1000000000, 0}, {1000000000, 500000}};
     Require(futimes_nid_postfix(descriptor, past) == 0);
