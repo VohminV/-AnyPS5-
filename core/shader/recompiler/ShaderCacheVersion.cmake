@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-file(STRINGS "${LIST_FILE}" entries)
+file(STRINGS "${LIST_FILE}" entries ENCODING UTF-8)
 set(sources)
 set(guard)
 set(submodules)

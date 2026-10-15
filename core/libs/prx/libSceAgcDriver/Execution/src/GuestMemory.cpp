@@ -1299,6 +1299,7 @@ void DescribeModule(std::uint64_t address, char* out, std::size_t outSize) {
 #endif
 
 void FlushLoop() {
+#ifdef _WIN32
     wchar_t exe[MAX_PATH] = {};
     const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return;
@@ -1317,12 +1318,33 @@ void FlushLoop() {
         std::fprintf(file, "# memjournal ring=%zu fields: seq kind(0=cpu,1=gpu) thread address size caller\n", kSize);
         std::fclose(file);
     }
+#else
+    char exe[4096] = {};
+    const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return;
+    exe[n] = '\0';
+    char* slash = std::strrchr(exe, '/');
+    if (slash == nullptr) return;
+    *slash = '\0';
+    char path[sizeof(exe) + 32];
+    std::snprintf(path, sizeof(path), "%s/memjournal.log", exe);
+    {
+        FILE* file = std::fopen(path, "w");
+        if (file == nullptr) return;
+        std::fprintf(file, "# memjournal ring=%zu fields: seq kind(0=cpu,1=gpu) thread address size caller\n", kSize);
+        std::fclose(file);
+    }
+#endif
     std::uint64_t flushed = 0;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(5));
         const auto now = head.load(std::memory_order_acquire);
         if (now == flushed) continue;
+#ifdef _WIN32
         FILE* file = _wfopen(path, L"a");
+#else
+        FILE* file = std::fopen(path, "a");
+#endif
         if (file == nullptr) {
             flushed = now;
             continue;

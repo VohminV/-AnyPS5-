@@ -510,6 +510,18 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     if (len > std::numeric_limits<size_t>::max() - alignment) {
         throw std::overflow_error("Aligned mapping size overflow");
     }
+#if defined(__linux__)
+    // Sony's bundled heap validates direct-memory ranges against the PS5
+    // physical windows (region end below ~253 GiB). Letting the host kernel
+    // pick the address lands huge mappings near the top of the address space
+    // and fails that validation, so prefer the low PS5 map area first and
+    // only fall back to the historical kernel-chosen placement below.
+    constexpr std::uintptr_t Ps5MapAreaHint = 0x0000000200000000ull;
+    try {
+        return MapAtOrAbove(Ps5MapAreaHint, len, prot, alignment);
+    } catch (const std::exception&) {
+    }
+#endif
     const size_t allocLen = len + alignment;
     void* result = mmap(nullptr, allocLen, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (result == MAP_FAILED) {
