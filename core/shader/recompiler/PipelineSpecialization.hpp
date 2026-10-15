@@ -26,6 +26,7 @@ inline constexpr std::uint32_t PushDataOffset = 8188u;
 inline constexpr std::uint32_t ExportBase = 8192u;
 inline constexpr std::uint32_t HeapCountBase = 8256u;
 inline constexpr std::uint32_t MipCountBase = 8320u;
+inline constexpr std::uint32_t SamplerNormalizeBase = 8448u;
 inline constexpr std::uint32_t DescriptorIndexBase = 16384u;
 inline constexpr std::uint32_t DescriptorIndexStride = 128u;
 inline constexpr std::uint32_t ImageModeBase = 32768u;

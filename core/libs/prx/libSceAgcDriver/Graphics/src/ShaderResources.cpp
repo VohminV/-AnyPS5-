@@ -1314,6 +1314,7 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
         packBits(binding.imageDepthCompare);
         packBits(binding.imageAtomic);
         packBits(binding.samplerUnnormalized);
+        packBits(binding.samplerNormalizeCoordinates);
         packBits(binding.imageUnnormalized);
         // Read-only elements are bound without a write set: an object built for one written set
         // must not serve a build with another (the variant implies it, this makes it explicit).
@@ -2563,15 +2564,23 @@ void ShaderResources::addImageBinding(const ShaderRecompiler::DescriptorBinding&
         Require(capacity <= context.limits.maxPerStageDescriptorSamplers, "shader sampler descriptors exceed per-stage limits");
         Require(binding.samplerDepthCompare.size() == binding.count, "guest sampler binding is missing depth comparison metadata");
         Require(binding.samplerUnnormalized.empty() || binding.samplerUnnormalized.size() == binding.count, "guest sampler binding has unnormalized coordinate metadata of another size");
+        Require(binding.samplerNormalizeCoordinates.empty() || binding.samplerNormalizeCoordinates.size() == binding.count, "guest sampler binding has normalized coordinate metadata of another size");
         for (std::uint32_t element = 0; element < binding.count; ++element) {
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
-            const bool compareEnable = binding.samplerDepthCompare.at(element);
-            const bool unnormalized = element < binding.samplerUnnormalized.size() && binding.samplerUnnormalized[element];
+            const auto compareEnable = binding.samplerDepthCompare.at(element);
+            const bool normalize = element < binding.samplerNormalizeCoordinates.size() && binding.samplerNormalizeCoordinates[element];
+            std::array<std::uint32_t, 4> normalizedWords{};
+            std::span<const std::uint32_t> keyWords = words;
+            if (normalize) {
+                normalizedWords = {words[0] & ~(1u << 15u), words[1], words[2], words[3]};
+                keyWords = normalizedWords;
+            }
+            const bool unnormalized = !normalize && element < binding.samplerUnnormalized.size() && binding.samplerUnnormalized[element];
             static const bool noSamplerCache = std::getenv("APS5_NO_SAMPLER_CACHE") != nullptr;
             if (context.samplerCache != nullptr && !noSamplerCache) {
-                samplers.push_back(context.samplerCache->Get(context, words, compareEnable, unnormalized));
+                samplers.push_back(context.samplerCache->Get(context, keyWords, compareEnable, unnormalized));
             } else {
-                auto resource = DecodeSamplerResource(words, unnormalized);
+                auto resource = DecodeSamplerResource(keyWords, unnormalized);
                 resource.compareEnable = compareEnable;
                 samplers.push_back(std::make_shared<Sampler>(context, resource));
             }

@@ -791,6 +791,10 @@ void APS5_VABI _ZN3sce4Json14InitParameter2C1Ev(InitParameter2* self) {
     *self = {};
 }
 
+void APS5_VABI _ZN3sce4Json14InitParameter2C2Ev(InitParameter2* self) {
+    *self = {};
+}
+
 void APS5_VABI _ZN3sce4Json14InitParameter212setAllocatorEPNS0_12MemAllocatorEPv(InitParameter2* self, void* allocator, void* userData) {
     self->allocator = allocator;
     self->userData = userData;
@@ -798,6 +802,12 @@ void APS5_VABI _ZN3sce4Json14InitParameter212setAllocatorEPNS0_12MemAllocatorEPv
 
 void APS5_VABI _ZN3sce4Json14InitParameter217setFileBufferSizeEm(InitParameter2* self, std::size_t size) {
     self->fileBufferSize = size;
+}
+
+APS5_EXPORT("W72B9ylU2JA", sceJsonUnknown_W72B9ylU2JA);
+int APS5_VABI sceJsonUnknown_W72B9ylU2JA(void) {
+    NotImplemented_nid_no_patch("W72B9ylU2JA");
+    return 0;
 }
 
 int APS5_VABI _ZN3sce4Json11Initializer10initializeEPKNS0_14InitParameter2E(void* self, const InitParameter2* parameter) {

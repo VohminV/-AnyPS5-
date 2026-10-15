@@ -352,6 +352,7 @@ struct DescriptorBinding {
     std::vector<bool> bufferWritten;
     std::vector<bool> samplerUnnormalized;
     std::vector<bool> imageUnnormalized;
+    std::vector<bool> samplerNormalizeCoordinates;
     std::vector<std::uint32_t> imageSamplers;
 };
 

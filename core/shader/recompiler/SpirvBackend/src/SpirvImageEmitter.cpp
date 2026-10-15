@@ -1358,6 +1358,58 @@ void EmitEmulatedCompareSample(SpirvValueEmitContext& ctx, const ImageEmitAccess
     ctx.Define(access.inst, TableResult(ctx, access, ResultVector(ctx, access, result, setup.numericClass, true, false)));
 }
 
+std::uint32_t NormalizeUnnormalizedSampleCoord(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, const SampleSetup& setup, std::uint32_t coord) {
+    auto& state = ctx.state;
+    const auto& mem = access.mem;
+    if ((state.program.Info().samplers.at(mem.sampler).uses & static_cast<std::uint32_t>(SamplerUseImplicitLod)) == 0u) {
+        return coord;
+    }
+    state.module.EmitCapability(spv::CapabilityImageQuery);
+    const auto image = LoadSampledImageDescriptor(state, mem.resource, access.slot);
+    const auto normalize = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::SamplerNormalizeBase + mem.sampler, 0u);
+    const auto flag = Binary(state, spv::OpINotEqual, TypeBool(state), normalize, ConstantU32(state, 0u));
+    const auto size = state.module.AllocateId();
+    state.module.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, access.image.dimension), size, image, ConstantU32(state, 0u));
+    const auto coordComps = setup.dimensionInfo.coordinateComponents;
+    const auto spatial = setup.dimensionInfo.spatialComponents;
+    const auto extent = [&](std::uint32_t axis) {
+        if (coordComps == 1u) {
+            return size;
+        }
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, size, axis);
+        return value;
+    };
+    const auto component = [&](std::uint32_t axis) {
+        if (coordComps == 1u) {
+            return coord;
+        }
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, coord, axis);
+        return value;
+    };
+    std::vector<std::uint32_t> divided;
+    for (std::uint32_t axis = 0u; axis < spatial; ++axis) {
+        divided.push_back(Binary(state, spv::OpFDiv, TypeF32(state), component(axis), Unary(state, spv::OpConvertUToF, TypeF32(state), extent(axis))));
+    }
+    std::uint32_t dividedCoord = 0;
+    if (coordComps == 1u) {
+        dividedCoord = divided[0];
+    } else {
+        for (std::uint32_t axis = spatial; axis < coordComps; ++axis) {
+            divided.push_back(component(axis));
+        }
+        dividedCoord = state.module.AllocateId();
+        if (coordComps == 2u) {
+            state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), dividedCoord, divided[0], divided[1]);
+        } else {
+            state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 3), dividedCoord, divided[0], divided[1], divided[2]);
+        }
+    }
+    const auto coordType = coordComps == 1u ? TypeF32(state) : TypeF32Vector(state, coordComps);
+    return Select(state, coordType, flag, dividedCoord, coord);
+}
+
 void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, const SampleSetup& setup) {
     auto& state = ctx.state;
     const auto& mem = access.mem;
@@ -1438,7 +1490,8 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
     }
     const auto sampled = MakeSampledImage(state, mem.resource, mem.sampler, access.slot);
     const auto sample = state.module.AllocateId();
-    std::vector<std::uint32_t> words = {opcode, resultType, sample, sampled, setup.coord};
+    const auto coord = NormalizeUnnormalizedSampleCoord(ctx, access, setup, setup.coord);
+    std::vector<std::uint32_t> words = {opcode, resultType, sample, sampled, coord};
     if (setup.dref) {
         words.push_back(drefValue);
     }

@@ -22,4 +22,9 @@ int APS5_VABI pthread_cancel_nid_postfix(void) {
     NotImplemented_nid_no_patch("0D4-FVvEikw");
     return 0;
 }
+
+APS5_EXPORT("9WK-vhNXimw", sceKernelUnknown_9WK_MvhNXimw);
+int APS5_VABI sceKernelUnknown_9WK_MvhNXimw(void) {
+    return 0;
+}
 }

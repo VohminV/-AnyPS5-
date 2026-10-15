@@ -1406,19 +1406,37 @@ void verifyUnnormalizedSamplers() {
     }
 
     const std::array<std::uint32_t, 5> pixelCode{0xf0800f08u, 0x00400801u, 0xf800180fu, 0x0b0a0908u, 0xbf810000u};
-    const auto pixelData = userData(unnormalized);
-    RecompileRequest pixel{};
-    pixel.shader = {ShaderStage::Fragment, 0x4f000u, pixelCode, 0, {}};
-    pixel.context.waveSize = 64;
-    pixel.context.userDataBaseRegister = 0;
-    pixel.context.userData = pixelData;
-    pixel.context.pixel = twoParameterPixel();
-    pixel.target.vulkanVersion = 0x00401000u;
-    pixel.target.spirvVersion = 0x00010300u;
-    pixel.target.subgroupSize = 64;
-    pixel.layout.pushConstantSizeBytes = 128;
-    pixel.useCache = false;
-    expectFailure([&] { static_cast<void>(Recompile(pixel)); }, "unnormalized guest sampler is used by an implicit-LOD sample, which is not implemented", "unnormalized samplers: a pixel image_sample was accepted");
+    const auto pixelRequest = [&](const std::array<std::uint32_t, 16>& data, std::uint64_t address) {
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Fragment, address, pixelCode, 0, {}};
+        request.context.waveSize = 64;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = data;
+        request.context.pixel = twoParameterPixel();
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 64;
+        request.layout.pushConstantSizeBytes = 128;
+        return request;
+    };
+    const auto pixelAccepted = Recompile(pixelRequest(userData(unnormalized), 0x4f000u));
+    require(proven(pixelAccepted, false), "unnormalized samplers: an implicit-LOD pixel image_sample was not normalized");
+    bool implicitLod = false;
+    bool querySize = false;
+    bool divide = false;
+    for (std::size_t cursor = 5; cursor < pixelAccepted.spirv.Words().size();) {
+        const auto words = pixelAccepted.spirv.Words();
+        const auto count = words[cursor] >> 16u;
+        require(count != 0 && count <= words.size() - cursor, "unnormalized samplers: truncated pixel SPIR-V");
+        const auto op = words[cursor] & 0xffffu;
+        implicitLod |= op == spv::OpImageSampleImplicitLod;
+        querySize |= op == spv::OpImageQuerySizeLod;
+        divide |= op == spv::OpFDiv;
+        cursor += count;
+    }
+    require(implicitLod && querySize && divide, "unnormalized samplers: the pixel sample does not normalize its coordinates");
+    const auto pixelPlain = Recompile(pixelRequest(userData(normalized), 0x50000u));
+    require(pixelPlain.variantId == pixelAccepted.variantId, "unnormalized samplers: the pixel sample compiled another variant");
 }
 
 void verifyUnusedUnnormalizedSampler() {
@@ -1444,6 +1462,23 @@ void verifyUnusedUnnormalizedSampler() {
     };
     const auto bindings = populate(info);
     require(bindings.size() == 2u && bindings[0].imageUnnormalized == std::vector<bool>{true} && bindings[1].samplerUnnormalized == std::vector<bool>{true}, "unnormalized samplers: an S# without live uses was not flagged");
+    auto implicit = info;
+    implicit.samplers[0].uses = static_cast<std::uint8_t>(ShaderRecompiler::SamplerUseImplicitLod);
+    implicit.runtimeImageModes = {ResourceMaterializer::RuntimeImageModes(implicit.images[0])};
+    BindingAllocationResult implicitAllocation;
+    implicitAllocation.layout.descriptors = {{DescriptorBindingForImage(implicit.images[0]), {0u}}, {DescriptorBindingKind::Samplers, {0u}}};
+    DescriptorBindingBuilder{}.Populate(implicitAllocation, implicit, IrShaderStage::Compute, 0u, snapshot, {});
+    bool normalizeSpec = false;
+    for (const auto& constant : implicitAllocation.specialization) {
+        if (constant.id != PipelineSpecialization::SamplerNormalizeBase) continue;
+        require(constant.value == 1u, "unnormalized samplers: the implicit-LOD sampler normalization spec is not set");
+        normalizeSpec = true;
+    }
+    require(normalizeSpec, "unnormalized samplers: the implicit-LOD sampler has no normalization spec");
+    for (const auto& binding : implicitAllocation.bindings) {
+        if (binding.role == DescriptorRole::GuestSamplers) require(binding.samplerUnnormalized == std::vector<bool>{false}, "unnormalized samplers: the implicit-LOD sampler was flagged unnormalized");
+        if (binding.role == DescriptorRole::GuestImages) require(binding.imageUnnormalized == std::vector<bool>{false}, "unnormalized samplers: the implicit-LOD image was flagged unnormalized");
+    }
     auto selected = info;
     selected.images[0].indirectRoot = 0u;
     expectFailure([&] { static_cast<void>(populate(selected)); }, "unnormalized guest sampler samples an image selected at run time, which is not implemented", "unnormalized samplers: an image table root was accepted");

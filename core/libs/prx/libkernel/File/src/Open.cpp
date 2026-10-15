@@ -210,6 +210,7 @@ extern "C" {
 
 int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
     APS5_LOG_OUT("path=%s flags=0x%X nativeFlags=0x%X mode=0%o", path, flags, MapFlags(flags), mode);
+    if (path != nullptr && *path == '\0') return SceErrorFromErrno(2);
     if (IsRandomDevicePath(path)) {
         const int mapped = MapFlags(flags);
         const auto backing = WriteRandomMaterialization();
@@ -230,7 +231,7 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
     auto native = ResolvePath_nid_no_patch(path);
     int fd = NativeOpen(native, MapFlags(flags), mode);
 #ifdef _WIN32
-    if (fd < 0 && errno != ENOENT) {
+    if (fd < 0) {
         std::error_code error;
         if (std::filesystem::is_directory(native, error)) fd = File::OpenDirectoryDescriptor(native);
     }

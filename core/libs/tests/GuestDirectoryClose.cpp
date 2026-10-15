@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -26,6 +27,7 @@ static void Check(bool value, int line) {
 #define Require(value) Check((value), __LINE__)
 
 static constexpr int ErrorEnotdir = static_cast<int>(0x80020014u);
+static constexpr int ErrorEnoent = static_cast<int>(0x80020002u);
 
 static void VerifyCloseReuse(const std::filesystem::path& root, const char* scenario,
                              bool useUnderscoreClose) {
@@ -61,6 +63,32 @@ int main() {
 
     VerifyCloseReuse(root, "close", false);
     VerifyCloseReuse(root, "underscore-close", true);
+
+    const std::string slashed = (root / "close").string() + "/";
+    const int directory = sceKernelOpen(slashed.c_str(),
+        SCE_KERNEL_O_RDONLY | SCE_KERNEL_O_DIRECTORY, 0);
+    Require(directory >= 0);
+    std::array<char, 256> entries{};
+    std::string names;
+    for (;;) {
+        const int read = sceKernelGetdents(directory, entries.data(), static_cast<int>(entries.size()));
+        Require(read >= 0);
+        if (read == 0) break;
+        int offset = 0;
+        while (offset < read) {
+            std::uint16_t recordLength = 0;
+            std::memcpy(&recordLength, entries.data() + offset + 4, sizeof(recordLength));
+            Require(recordLength > 8 && offset + recordLength <= read);
+            const auto nameLength = static_cast<std::uint8_t>(entries[offset + 7]);
+            names += std::string(entries.data() + offset + 8, nameLength) + '\n';
+            offset += recordLength;
+        }
+    }
+    Require(names.find(".\n") != std::string::npos);
+    Require(names.find("entry.txt\n") != std::string::npos);
+    Require(close_nid_postfix(directory) == 0);
+
+    Require(sceKernelOpen("", SCE_KERNEL_O_RDONLY, 0) == ErrorEnoent);
 
     std::filesystem::remove_all(root);
 }

@@ -161,23 +161,25 @@ const char* UnnormalizedUseReason(std::uint32_t uses) {
 struct UnnormalizedProof {
     std::vector<bool> samplers;
     std::vector<bool> images;
+    std::vector<bool> normalize;
 };
 
 UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapshot& snapshot) {
-    UnnormalizedProof proof{std::vector<bool>(info.samplers.size()), std::vector<bool>(info.images.size())};
+    UnnormalizedProof proof{std::vector<bool>(info.samplers.size()), std::vector<bool>(info.images.size()), std::vector<bool>(info.samplers.size())};
     for (std::uint32_t r = 0; r < info.samplers.size(); r++) {
         if (snapshot.samplers.at(r).dwordCount != 4u) fail("sampler descriptor must contain four dwords");
         if ((snapshot.samplers[r].dwords[0] & ForceUnnormalizedBit) == 0u) {
             continue;
         }
         const auto& sampler = info.samplers[r];
-        const std::uint32_t unsupported = sampler.uses & ~static_cast<std::uint32_t>(SamplerUseExplicitLod);
+        const std::uint32_t unsupported = sampler.uses & ~(static_cast<std::uint32_t>(SamplerUseExplicitLod) | static_cast<std::uint32_t>(SamplerUseImplicitLod));
         if (unsupported != 0u) {
             failUnnormalized(UnnormalizedUseReason(unsupported));
         }
         if (sampler.depthCompare) {
             failUnnormalized("is used with depth comparison");
         }
+        const bool normalize = (sampler.uses & static_cast<std::uint32_t>(SamplerUseImplicitLod)) != 0u;
         for (const auto& pair : info.sampledPairs) {
             if (pair.sampler != r) {
                 continue;
@@ -196,9 +198,14 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
             if (image.conversionFormat != IrBufferFormat::Invalid || image.packed) {
                 failUnnormalized("samples an image that needs a format conversion or packed access");
             }
-            proof.images[pair.image] = true;
+            if (!normalize) {
+                proof.images[pair.image] = true;
+            }
         }
-        proof.samplers[r] = true;
+        if (!normalize) {
+            proof.samplers[r] = true;
+        }
+        proof.normalize[r] = normalize;
     }
     return proof;
 }
@@ -250,6 +257,10 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     if (info.images.size() > ShaderInfo::MaxImages) fail("runtime image count exceeds the static capacity");
     DescriptorBindingPlan plan;
     const auto unnormalized = ProveUnnormalized(info, snapshot);
+    for (std::uint32_t r = 0; r < info.samplers.size(); ++r) {
+        if ((info.samplers[r].uses & static_cast<std::uint32_t>(SamplerUseImplicitLod)) == 0u) continue;
+        plan.specialization.push_back({PipelineSpecialization::SamplerNormalizeBase + r, unnormalized.normalize.at(r) ? 1u : 0u});
+    }
     std::vector<std::uint32_t> compareStates(info.images.size());
     for (std::uint32_t index = 0; index < info.images.size(); ++index) {
         if (!info.images[index].depthCompare) continue;
@@ -407,6 +418,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 for (const auto& pair : info.sampledPairs) if (pair.sampler == resource) compare |= info.images.at(pair.image).depthCompare && compareStates.at(pair.image) == 0u;
                 physical.samplerDepthCompare.push_back(compare);
                 physical.samplerUnnormalized.push_back(unnormalized.samplers.at(resource));
+                physical.samplerNormalizeCoordinates.push_back(unnormalized.normalize.at(resource));
                 if ((originals[element] & 1u) != 0u) entry.samplerFilterElements.push_back(element);
             }
         } else if (physical.role == DescriptorRole::ShaderData && layout.UsesPushData()) {

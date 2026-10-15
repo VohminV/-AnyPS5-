@@ -254,8 +254,9 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.imageAtomic64);
     writer.Flags(binding.bufferAtomic);
     writer.Flags(binding.bufferWritten);
-    writer.Flags(binding.samplerUnnormalized);
-    writer.Flags(binding.imageUnnormalized);
+        writer.Flags(binding.samplerUnnormalized);
+        writer.Flags(binding.samplerNormalizeCoordinates);
+        writer.Flags(binding.imageUnnormalized);
     writer.Values(std::span<const std::uint32_t>(binding.imageSamplers));
 }
 
@@ -277,8 +278,9 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.imageAtomic64);
     reader.Flags(binding.bufferAtomic);
     reader.Flags(binding.bufferWritten);
-    reader.Flags(binding.samplerUnnormalized);
-    reader.Flags(binding.imageUnnormalized);
+        reader.Flags(binding.samplerUnnormalized);
+        reader.Flags(binding.samplerNormalizeCoordinates);
+        reader.Flags(binding.imageUnnormalized);
     reader.Values(binding.imageSamplers);
 }
 
