@@ -36,6 +36,19 @@ Before any build, file processing, or game launch, do all of these in order:
   project's `self_inspector` (`--report`/`--extract`, plaintext remap, no
   crypto) into a **separate** directory; the original file is preserved.
   Never invent third-party converter CLIs and never download tools ad hoc.
+- Game layout (dump root vs input dir vs output): the user names the dump
+  root (e.g. `E:\PPSA21733`, which contains only `app0/`). `--game-dir`
+  must point at the input dir holding `eboot.bin` plus `sce_module/`
+  (e.g. `E:\PPSA21733\app0`), never at the dump root. The Relinker
+  `--output` goes **beside** the input dir (e.g. `E:\PPSA21733\app.exe`
+  for windows, `E:\PPSA21733\app.elf` for linux), because the runtime
+  layout is `app.exe + libs/ + app0/` per `docs/user/USAGE.md`.
+  If `--game-dir` has no `eboot.bin`/`input.elf`/`app.elf` but has an
+  `app0/` subdir containing them, re-run with `--game-dir <dir>\app0`
+  and `--output <dir>\app.exe` (windows) — do not place the output
+  inside `app0/`. Evidence: `GuestModuleBuilder.cpp` writes guest
+  modules to `<output-dir>/app0/sce_module/*.guest.prx`, `main.cpp`
+  prints the `app.exe + libs/ + app0/` layout.
 - Before editing sources, establish root cause plus a reproducible test.
 - Keep an attempt log: inputs, command, environment, tool version, exit code,
   validation result (`logs/run_*.log`, failures in
@@ -72,7 +85,13 @@ When implementing new features or fixes:
 - Analysis: OS-level owner guard cannot see in-game TLSF free/realloc inside the same mapped arena; gen==0 (untracked) write-watch stamps stay silent on free-list pop (reads before writes), so stale GPU results were stored over the new owner's live bytes
 - Fix: `streamingTextureMutex` is now `recursive_mutex`, held ONLY for the gen==0 fast-path check (never across FlushPending/GPU waits), skipped when GpuMutex is held (avoids streaming->Gpu vs Gpu->streaming inversion); plus TLSF-reuse guard in `writeBackLayers`: for gen==0 compare guest vs `original` snapshot before storing, drop on mismatch
 - Kill switch: `APS5_NO_REFRESH_FAST_PATH=1` disables fast path AND streaming mutex (reuse guard also gated by `unregisteredDrop`)
-- Ship patched libs: build `libs` target (NID patcher), copy from `build/core/libs/libs/*.prx` (NOT `unpatched/`) into game `libs/`
+- Ship patched libs: per-game persistent store is `lib/<GAMEID>/` in this repo
+  (e.g. `lib/PPSA21733/`, patched `.prx` set). Upstream source is
+  `build/core/libs/libs/*.prx` (NOT `unpatched/`); refresh `lib/<GAMEID>/`
+  whenever libs are rebuilt. After any relink/rebuild, restore the game's
+  `libs/` from `lib/<GAMEID>/` and verify the file count — a missing/short
+  `libs/` causes Windows LoadLibrary error 126 at launch. MinGW-built libs
+  additionally need `libstdc++-6.dll` reachable (beside `app.exe` or on PATH).
 
 ### Build Commands
 ```bash
