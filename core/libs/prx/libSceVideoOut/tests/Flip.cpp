@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <string>
 #include <limits>
@@ -487,9 +488,42 @@ void testFlipAfterGpuWork() {
 
 }
 
+void testOutputResolution() {
+#ifdef _WIN32
+    const auto setCap = [](const char* value) { check(_putenv_s("ANYPS5_OUTPUT_MAX_HEIGHT", value) == 0, "cannot set output cap"); };
+#else
+    const auto setCap = [](const char* value) { check(::setenv("ANYPS5_OUTPUT_MAX_HEIGHT", value, 1) == 0, "cannot set output cap"); };
+#endif
+    setCap("");
+    const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
+    auto cfg = VideoOutDriver::Get().GetConfig(handle);
+    VideoOutOutputStatus status{};
+    check(sceVideoOutGetOutputStatus(handle, &status) == 0, "output status failed");
+    check(status.resolution == 1, "default output is not 1080p");
+    {
+        std::lock_guard lock(cfg->mutex);
+        cfg->width = 3840;
+        cfg->height = 2160;
+    }
+    check(sceVideoOutGetOutputStatus(handle, &status) == 0, "output status failed");
+    check(status.resolution == 1, "4K output size advertised a 4K display");
+    setCap("0");
+    check(sceVideoOutGetOutputStatus(handle, &status) == 0, "output status failed");
+    check(status.resolution == 2, "uncapped output did not report 4K");
+    setCap("2160");
+    check(sceVideoOutGetOutputStatus(handle, &status) == 0, "output status failed");
+    check(status.resolution == 2, "raised cap did not report 4K");
+    setCap("");
+    check(sceVideoOutGetOutputStatus(handle, &status) == 0, "output status failed");
+    check(status.resolution == 1, "restored cap did not report 1080p");
+    check(sceVideoOutClose(handle) == 0, "close failed");
+    LibcRunShutdown_nid_postfix();
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "decode") testDecode();
+        else if (argc == 2 && std::string(argv[1]) == "resolution") testOutputResolution();
         else if (argc == 2 && std::string(argv[1]) == "controls") testControls();
         else if (argc == 2 && std::string(argv[1]) == "present") testPresentation(false);
         else if (argc == 2 && std::string(argv[1]) == "backtoback") testBackToBack();

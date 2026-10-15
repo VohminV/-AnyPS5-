@@ -95,6 +95,8 @@ int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIn
     cfg->groups[setIndex] = group;
     cfg->width = attribute->width;
     cfg->height = attribute->height;
+    std::fprintf(stderr, "[videoout-tmp] register buffers %ux%u x%d\n", attribute->width, attribute->height, bufferNum); // TEMP-VIDEOUT
+    std::fflush(stderr); // TEMP-VIDEOUT
     for (int i = 0; i < bufferNum; i++) {
         cfg->buffers[bufferIndexStart + i] = registered[i];
     }

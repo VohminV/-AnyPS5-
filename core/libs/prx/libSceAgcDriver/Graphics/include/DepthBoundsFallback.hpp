@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DEPTHBOUNDSFALLBACK_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DEPTHBOUNDSFALLBACK_HPP
 
+#include "Recompiler.hpp"
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -10,8 +11,10 @@ namespace AgcDriver::Graphics {
 
 // How depth-bounds test requests are served on the current device. Chosen
 // once at device init by ResolveDepthBoundsBackend; pipelines and draws only
-// read the outcome, never re-derive it.
-enum class DepthBoundsBackend { Hardware, CpuFallback };
+// read the outcome, never re-derive it. Unsupported is not a usable mode: it
+// names the resolve-failure outcome (unknown override, or forced hardware on
+// a device without the feature), which is logged and thrown, never stored.
+enum class DepthBoundsBackend { Hardware, CpuFallback, Unsupported };
 
 // Centralized mode selection: `supported` is
 // VkPhysicalDeviceFeatures::depthBounds, `override` is APS5_DEPTH_BOUNDS
@@ -38,6 +41,29 @@ inline constexpr std::uint32_t DepthBoundsPushOffsetBytes = 120;
 inline constexpr std::uint32_t DepthBoundsPushMinDword = 30;
 inline constexpr std::uint32_t DepthBoundsPushMaxDword = 31;
 
+// One fragment shader as the planner sees it (a view of CompiledShader,
+// decoupled so the plan stays unit-testable without Vulkan objects).
+struct DepthBoundsFallbackShader {
+    ShaderRecompiler::ShaderStage stage;
+    std::span<const std::uint32_t> spirv;
+    std::uint32_t pushConstantOffset = 0;
+    std::size_t pushConstantBytes = 0;
+};
+
+struct DepthBoundsFallbackPlan {
+    bool active = false;
+    std::size_t fragment = 0;
+    std::vector<std::uint32_t> spirv;
+};
+
+// Decides and prepares the fallback for one pipeline from draw state (no
+// Vulkan calls): inactive unless a depth plane has the test on while the
+// fallback mode is selected. Refuses loudly (mesh shading overlays the same
+// push tail; several fragment stages; push overlap; untransformable module)
+// instead of building a silently wrong pipeline.
+DepthBoundsFallbackPlan PlanDepthBoundsFallback(bool hasDepth, bool testEnabled, bool fallbackMode, bool meshPath,
+    std::span<const DepthBoundsFallbackShader> shaders);
+
 // Rewrites a fragment module to discard fragments outside the push-constant
 // bounds (OpKill when FragCoord.z is outside [min, max], inclusive edges).
 // The module keeps its single fragment entry point; hardware depth-bounds
@@ -48,15 +74,17 @@ inline constexpr std::uint32_t DepthBoundsPushMaxDword = 31;
 std::vector<std::uint32_t> ApplyDepthBoundsFallback(std::span<const std::uint32_t> spirv);
 
 // Running totals for the [DepthBounds] diagnostics (fallback pipelines
-// created, transforms applied, transform refusals). Updated at pipeline
-// creation, never per frame.
+// created, hardware depth-bounds pipelines created, transforms applied,
+// transform refusals). Updated at pipeline creation, never per frame.
 struct DepthBoundsFallbackStats {
     std::uint64_t pipelines = 0;
+    std::uint64_t hardwarePipelines = 0;
     std::uint64_t transforms = 0;
     std::uint64_t refusals = 0;
     std::uint64_t transformMicroseconds = 0;
 };
 void NoteDepthBoundsFallbackPipeline(std::uint64_t transformMicroseconds);
+void NoteDepthBoundsHardwarePipeline();
 void NoteDepthBoundsFallbackRefusal();
 DepthBoundsFallbackStats GetDepthBoundsFallbackStats();
 

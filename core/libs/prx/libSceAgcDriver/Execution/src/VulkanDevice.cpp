@@ -1021,7 +1021,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         try {
             mode = Graphics::ResolveDepthBoundsBackend(available.depthBounds == VK_TRUE, override != nullptr ? override : "");
         } catch (const std::exception& error) {
-            std::fprintf(stderr, "[DepthBounds] backend=unsupported device=\"%s\" supported=%u reason=\"%s\"\n",
+            std::fprintf(stderr, "[DepthBounds] backend=%s device=\"%s\" supported=%u reason=\"%s\"\n",
+                Graphics::DepthBoundsBackendText(Graphics::DepthBoundsBackend::Unsupported),
                 state->properties.deviceName, static_cast<unsigned>(available.depthBounds == VK_TRUE), error.what());
             std::fflush(stderr);
             throw;

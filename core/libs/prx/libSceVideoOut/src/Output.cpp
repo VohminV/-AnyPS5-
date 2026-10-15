@@ -2,6 +2,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -134,6 +135,18 @@ int APS5_VABI sceVideoOutGetVblankStatus(int handle, VideoOutVblankStatus* statu
     LibcAwaitExit_nid_postfix();
 }
 
+static long OutputMaxHeight() {
+    // Strict Full HD output reporting: the presented display defaults to
+    // 1920x1080, so the status never advertises 4K even when the title
+    // registers bigger flip buffers. ANYPS5_OUTPUT_MAX_HEIGHT overrides the
+    // cap (0 = report from the buffers, as before).
+    const char* raw = std::getenv("ANYPS5_OUTPUT_MAX_HEIGHT");
+    if (raw == nullptr || *raw == '\0') return 1080;
+    char* end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    return (end == raw || value < 0) ? 1080 : value;
+}
+
 int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status) try {
     if (status == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
@@ -144,7 +157,14 @@ int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* statu
     }
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
-    status->resolution = (cfg->width >= 3840 || cfg->height >= 2160) ? 2u : 1u;
+    const long cap = OutputMaxHeight();
+    std::uint64_t effectiveWidth = cfg->width;
+    std::uint64_t effectiveHeight = cfg->height;
+    if (cap > 0 && cfg->height > static_cast<std::uint32_t>(cap)) {
+        effectiveHeight = static_cast<std::uint64_t>(cap);
+        effectiveWidth = cfg->height != 0 ? static_cast<std::uint64_t>(cfg->width) * effectiveHeight / cfg->height : cfg->width;
+    }
+    status->resolution = (effectiveWidth >= 3840 || effectiveHeight >= 2160) ? 2u : 1u;
     status->dynamicRange = 1;
     status->refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
     status->flags = 0;

@@ -889,8 +889,41 @@ void DepthBoundsFallbackTests() {
     Require(ResolveDepthBoundsBackend(true, "Cpu") == DepthBoundsBackend::CpuFallback, "forced fallback must win on capable hardware");
     expectFailure([] { ResolveDepthBoundsBackend(false, "hardware"); }, "does not support depthBounds");
     expectFailure([] { ResolveDepthBoundsBackend(true, "bogus"); }, "auto, hardware or cpu");
+    {
+        // Pipeline-level plan: pure decision, no Vulkan objects.
+        using AgcDriver::Graphics::DepthBoundsFallbackShader;
+        using AgcDriver::Graphics::PlanDepthBoundsFallback;
+        const std::vector<std::uint32_t> body{0x07230203u, 0x00010000u, 0u, 2u, 0u};
+        const DepthBoundsFallbackShader fragment{ShaderRecompiler::ShaderStage::Fragment, body, 0, 0};
+        const DepthBoundsFallbackShader vertex{ShaderRecompiler::ShaderStage::Vertex, body, 0, 0};
+        Require(!PlanDepthBoundsFallback(false, false, false, false, {}).active, "plan without a request");
+        Require(!PlanDepthBoundsFallback(true, false, true, false, {&fragment, 1}).active, "plan with a disabled test");
+        Require(!PlanDepthBoundsFallback(true, true, false, false, {&fragment, 1}).active, "plan without the fallback mode");
+        Require(!PlanDepthBoundsFallback(true, true, true, false, {}).active, "plan without shaders");
+        Require(!PlanDepthBoundsFallback(true, true, true, false, {&vertex, 1}).active, "plan without a fragment stage");
+        expectFailure([&] { PlanDepthBoundsFallback(true, true, true, true, {&fragment, 1}); }, "mesh shading");
+        const DepthBoundsFallbackShader second = fragment;
+        const DepthBoundsFallbackShader pair[2] = {fragment, second};
+        expectFailure([&] { PlanDepthBoundsFallback(true, true, true, false, {pair, 2}); }, "several fragment stages");
+        const DepthBoundsFallbackShader overlapping{ShaderRecompiler::ShaderStage::Fragment, body, 112, 16};
+        expectFailure([&] { PlanDepthBoundsFallback(true, true, true, false, {&overlapping, 1}); }, "overlaps the shader push constants");
+        const DepthBoundsFallbackShader adjacent{ShaderRecompiler::ShaderStage::Fragment, body, 0, 120};
+        expectFailure([&] { PlanDepthBoundsFallback(true, true, true, false, {&adjacent, 1}); }, "no fragment entry point");
+    }
     Require(AgcDriver::Graphics::DepthBoundsBackendText(DepthBoundsBackend::Hardware) == std::string_view("hardware"), "backend text changed");
     Require(AgcDriver::Graphics::DepthBoundsBackendText(DepthBoundsBackend::CpuFallback) == std::string_view("cpu-fallback"), "backend text changed");
+    Require(AgcDriver::Graphics::DepthBoundsBackendText(DepthBoundsBackend::Unsupported) == std::string_view("unsupported"), "backend text changed");
+    {
+        // Hardware depth-bounds pipeline counter: deltas only, so earlier
+        // tests in this process cannot disturb the expectation.
+        const auto before = AgcDriver::Graphics::GetDepthBoundsFallbackStats();
+        AgcDriver::Graphics::NoteDepthBoundsHardwarePipeline();
+        AgcDriver::Graphics::NoteDepthBoundsHardwarePipeline();
+        const auto after = AgcDriver::Graphics::GetDepthBoundsFallbackStats();
+        Require(after.hardwarePipelines == before.hardwarePipelines + 2, "hardware pipeline counter changed");
+        Require(after.pipelines == before.pipelines && after.transforms == before.transforms && after.refusals == before.refusals,
+            "hardware note disturbed the fallback counters");
+    }
     for (const bool depth : {false, true}) {
         for (const bool test : {false, true}) {
             for (const bool mode : {false, true}) {

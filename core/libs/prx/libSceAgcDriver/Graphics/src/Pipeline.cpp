@@ -105,42 +105,26 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
     const bool needsBounds = state.depth.has_value() && state.depthBoundsTest;
     Require(!needsBounds || context.depthBounds || context.depthBoundsFallback, "device does not support the depth bounds test");
     std::size_t fallbackFragment = shaders.size();
-    if (NeedsDepthBoundsFallback(state.depth.has_value(), state.depthBoundsTest, context.depthBoundsFallback)) {
+    {
         // CPU fallback: the device cannot do the test, so the fragment
         // shader discards out-of-range fragments with per-draw push-constant
-        // bounds. Anything the transform cannot carry refuses loudly below,
-        // never silently (mesh shading overlays the same push-constant tail
-        // the bounds slot lives in).
-        for (std::size_t i = 0; i < shaders.size(); ++i) {
-            if (shaders[i].stage == ShaderRecompiler::ShaderStage::Mesh) {
-                NoteDepthBoundsFallbackRefusal();
-                Require(false, "depth bounds fallback does not support mesh shading");
-            }
-            if (shaders[i].stage == ShaderRecompiler::ShaderStage::Fragment) {
-                Require(fallbackFragment == shaders.size(), "depth bounds fallback does not support several fragment stages");
-                fallbackFragment = static_cast<std::size_t>(i);
-            }
+        // bounds (planned once here, no per-draw decisions downstream).
+        std::vector<DepthBoundsFallbackShader> fallbackShaders;
+        fallbackShaders.reserve(shaders.size());
+        for (const auto& shader : shaders) {
+            Require(shader.program != nullptr, "missing compiled shader");
+            fallbackShaders.push_back(
+                {shader.stage, {shader.program->spirv.data(), shader.program->spirv.size()}, shader.pushConstantOffset, shader.program->pushConstants.size()});
         }
-        if (fallbackFragment != shaders.size()) {
-            Require(shaders[fallbackFragment].program != nullptr, "missing compiled shader");
-            const auto usedBegin = shaders[fallbackFragment].pushConstantOffset;
-            const auto usedEnd = usedBegin + static_cast<std::uint32_t>(shaders[fallbackFragment].program->pushConstants.size());
-            if (usedEnd > DepthBoundsPushOffsetBytes && usedBegin < DepthBoundsPushOffsetBytes + 8u) {
-                NoteDepthBoundsFallbackRefusal();
-                Require(false, "depth bounds fallback push slot overlaps the shader push constants");
-            }
-            const auto start = std::chrono::steady_clock::now();
-            try {
-                fallbackFragmentSpirv = ApplyDepthBoundsFallback({shaders[fallbackFragment].program->spirv.data(), shaders[fallbackFragment].program->spirv.size()});
-            } catch (...) {
-                NoteDepthBoundsFallbackRefusal();
-                throw;
-            }
-            NoteDepthBoundsFallbackPipeline(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
+        DepthBoundsFallbackPlan fallbackPlan = PlanDepthBoundsFallback(
+            state.depth.has_value(), state.depthBoundsTest, context.depthBoundsFallback, state.stages.mesh.has_value(), fallbackShaders);
+        if (fallbackPlan.active) {
+            depthBoundsFallback = true;
+            fallbackFragment = fallbackPlan.fragment;
+            fallbackFragmentSpirv = std::move(fallbackPlan.spirv);
+        } else {
+            depthBounds = needsBounds && context.depthBounds;
         }
-        depthBoundsFallback = true;
-    } else {
-        depthBounds = needsBounds && context.depthBounds;
     }
     Require(!depthBias || state.depthBiasClamp == 0.0f || context.depthBiasClamp, "device does not support depth bias clamping");
     Require(!state.negativeOneToOne || context.depthClipControl, "negative-one-to-one depth clipping requires VK_EXT_depth_clip_control with depthClipControl enabled");
@@ -166,17 +150,6 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         specializations.reserve(shaders.size());
         for (std::uint32_t i = 0; i < shaders.size(); ++i) {
             const auto& shader = *shaders[i].program;
-            // TEMP-DBDIAG: identify modules handed to the driver (igc64 crash triage).
-            {
-                std::uint64_t hash = 14695981039346656037ull;
-                for (std::size_t k = 0; k < shader.spirv.size(); ++k) {
-                    hash ^= shader.spirv.data()[k];
-                    hash *= 1099511628211ull;
-                }
-                std::fprintf(stderr, "[dbdiag] module stage=%u words=%zu hash=%016llx variant=%llu\n", static_cast<unsigned>(shaders[i].stage),
-                    shader.spirv.size(), static_cast<unsigned long long>(hash), static_cast<unsigned long long>(shader.PipelineVariantId()));
-                std::fflush(stderr);
-            }
             VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             const bool swapped = depthBoundsFallback && i == static_cast<std::uint32_t>(fallbackFragment);
             module.codeSize = (swapped ? fallbackFragmentSpirv.size() : shader.spirv.size()) * sizeof(std::uint32_t);
@@ -313,6 +286,12 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             const auto totals = GetDepthBoundsFallbackStats();
             std::fprintf(stderr, "[DepthBounds] fallback pipeline created (%llu total, transform %llu us total)\n",
                 static_cast<unsigned long long>(totals.pipelines), static_cast<unsigned long long>(totals.transformMicroseconds));
+            std::fflush(stderr);
+        } else if (depthBounds) {
+            NoteDepthBoundsHardwarePipeline();
+            const auto totals = GetDepthBoundsFallbackStats();
+            std::fprintf(stderr, "[DepthBounds] hardware depth-bounds pipeline created (%llu total)\n",
+                static_cast<unsigned long long>(totals.hardwarePipelines));
             std::fflush(stderr);
         }
     } catch (...) {

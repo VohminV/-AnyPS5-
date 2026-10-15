@@ -10,16 +10,12 @@
 #include <unordered_map>
 
 namespace AgcDriver::Graphics {
+[[noreturn]] void Unsupported(const std::string& reason);
 namespace {
-
 constexpr std::uint32_t kSpirvMagic = 0x07230203;
 // The backend declares the push block as u32[32] (see ShaderValidation);
 // the fallback reads the last two dwords of that block.
 constexpr std::uint32_t kPushBlockDwords = 32;
-
-[[noreturn]] void Unsupported(const std::string& reason) {
-    throw std::runtime_error("depth bounds fallback unsupported: " + reason);
-}
 
 bool EqualsIgnoreCase(std::string_view left, const char* right) {
     std::size_t index = 0;
@@ -51,12 +47,18 @@ DepthBoundsBackend ResolveDepthBoundsBackend(bool supported, std::string_view ov
 }
 
 const char* DepthBoundsBackendText(DepthBoundsBackend backend) {
-    return backend == DepthBoundsBackend::Hardware ? "hardware" : "cpu-fallback";
+    if (backend == DepthBoundsBackend::Hardware) return "hardware";
+    if (backend == DepthBoundsBackend::CpuFallback) return "cpu-fallback";
+    return "unsupported";
 }
 
 namespace {
 
 std::atomic<std::uint64_t>& FallbackPipelines() {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+std::atomic<std::uint64_t>& HardwarePipelines() {
     static std::atomic<std::uint64_t> count{0};
     return count;
 }
@@ -80,6 +82,10 @@ void NoteDepthBoundsFallbackPipeline(std::uint64_t transformMicroseconds) {
     FallbackTransformMicroseconds() += transformMicroseconds;
 }
 
+void NoteDepthBoundsHardwarePipeline() {
+    ++HardwarePipelines();
+}
+
 void NoteDepthBoundsFallbackRefusal() {
     ++FallbackRefusals();
 }
@@ -87,6 +93,7 @@ void NoteDepthBoundsFallbackRefusal() {
 DepthBoundsFallbackStats GetDepthBoundsFallbackStats() {
     DepthBoundsFallbackStats stats{};
     stats.pipelines = FallbackPipelines().load();
+    stats.hardwarePipelines = HardwarePipelines().load();
     stats.transforms = FallbackTransforms().load();
     stats.refusals = FallbackRefusals().load();
     stats.transformMicroseconds = FallbackTransformMicroseconds().load();
@@ -524,6 +531,48 @@ std::vector<std::uint32_t> Transform(const Reader& reader, std::uint32_t bound) 
 }
 
 } // namespace
+
+[[noreturn]] void Unsupported(const std::string& reason) {
+    throw std::runtime_error("depth bounds fallback unsupported: " + reason);
+}
+
+DepthBoundsFallbackPlan PlanDepthBoundsFallback(bool hasDepth, bool testEnabled, bool fallbackMode, bool meshPath,
+    std::span<const DepthBoundsFallbackShader> shaders) {
+    DepthBoundsFallbackPlan plan{};
+    if (!NeedsDepthBoundsFallback(hasDepth, testEnabled, fallbackMode)) return plan;
+    if (meshPath) {
+        NoteDepthBoundsFallbackRefusal();
+        Unsupported("mesh shading");
+    }
+    bool found = false;
+    for (std::size_t i = 0; i < shaders.size(); ++i) {
+        if (shaders[i].stage != ShaderRecompiler::ShaderStage::Fragment) continue;
+        if (found) {
+            NoteDepthBoundsFallbackRefusal();
+            Unsupported("several fragment stages");
+        }
+        found = true;
+        plan.fragment = i;
+    }
+    if (!found) return plan;
+    const auto& fragment = shaders[plan.fragment];
+    const auto usedBegin = fragment.pushConstantOffset;
+    const auto usedEnd = usedBegin + static_cast<std::uint32_t>(fragment.pushConstantBytes);
+    if (usedEnd > DepthBoundsPushOffsetBytes && usedBegin < DepthBoundsPushOffsetBytes + 8u) {
+        NoteDepthBoundsFallbackRefusal();
+        Unsupported("push slot overlaps the shader push constants");
+    }
+    const auto start = std::chrono::steady_clock::now();
+    try {
+        plan.spirv = ApplyDepthBoundsFallback(fragment.spirv);
+    } catch (...) {
+        NoteDepthBoundsFallbackRefusal();
+        throw;
+    }
+    NoteDepthBoundsFallbackPipeline(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()));
+    plan.active = true;
+    return plan;
+}
 
 std::vector<std::uint32_t> ApplyDepthBoundsFallback(std::span<const std::uint32_t> spirv) {
     const auto start = std::chrono::steady_clock::now();
