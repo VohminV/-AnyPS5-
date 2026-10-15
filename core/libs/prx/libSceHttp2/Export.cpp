@@ -16,7 +16,6 @@ static std::mutex g_completionsMutex;
 static std::unordered_map<int, std::deque<Http2AsyncResult>> g_completions;
 
 static void CompleteAsync(const char* function, int req_id, const Http2AsyncOption* kqueue_option, const void* option) {
-    if (kqueue_option == nullptr) NotImplemented_nid_no_patch(function);
     if (option != nullptr) NotImplemented_nid_no_patch(function);
     {
         std::lock_guard lock(g_completionsMutex);
@@ -25,6 +24,7 @@ static void CompleteAsync(const char* function, int req_id, const Http2AsyncOpti
         completion.result = ERROR_NETWORK;
         g_completions[req_id].push_back(completion);
     }
+    if (kqueue_option == nullptr) return;
     if (EqueueTriggerEvent_nid_postfix(kqueue_option->equeue, static_cast<uintptr_t>(kqueue_option->user_event_id), EVFILT_USER, kqueue_option->user_data) != 0) {
         std::lock_guard lock(g_completionsMutex);
         g_completions[req_id].pop_back();
