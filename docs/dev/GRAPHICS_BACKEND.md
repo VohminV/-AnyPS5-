@@ -97,3 +97,29 @@ RTX 3050. Months of work, and MinGW cannot compile shaders without DXC.
 * `crash.log` beside the exe (stderr is lost on double-click)
   (`libc/.../windows/CrashReport.cpp`).
 * Enriched `readRegister` message with the register offset.
+
+## Fork additions since upstream (AgcDriver)
+
+New files and behavior that upstream `AnyPS5` does not have (verified against
+a clean upstream tree):
+
+* `CpuBackend/` — CPU packet-execution backend
+  (`core/libs/prx/libSceAgcDriver/CpuBackend/`): decode/exec/schedule with
+  SIMD (AVX2/SSE) paths, resource cache, `Legacy`/`Fast`/`Auto` modes selected
+  by `ANYPS5_CPU_BACKEND` (`CpuBackend/src/Backend.cpp:8`).
+* `DepthBoundsFallback` (`Graphics/include/DepthBoundsFallback.hpp`): devices
+  without `VkPhysicalDeviceFeatures::depthBounds` serve depth-bounds tests on
+  the CPU; override via `APS5_DEPTH_BOUNDS` (`hardware`/`cpu`/auto, forced
+  hardware without support throws instead of silently disabling the test).
+* `GuestUnifiedMemory` (`Execution/include/GuestUnifiedMemory.hpp`):
+  capability-driven UMA semantics over split PC memory (`DirectMap` vs
+  `SeparateBacking`, software 64KiB dirty stamps; page-fault tracking OFF by
+  default).
+* Storage-texture write-back owner guard and TLSF-reuse guard
+  (`Graphics/src/Texture.cpp`): `writeBackLayers` drops stale GPU results when
+  guest memory changed while they were pending (`[gpu] storage image ...:
+  keeping the CPU's blocks`) and when the owner generation was reused;
+  striped `streamingStripeMutexes` are held only for the fast-path check.
+  Kill switches: `APS5_NO_REFRESH_FAST_PATH=1` (disables fast path and the
+  streaming-stripe locking), `APS5_NO_UNREGISTERED_DROP=1` (disables
+  unregistered-baseline drops).

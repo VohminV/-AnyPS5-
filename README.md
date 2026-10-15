@@ -38,6 +38,16 @@ Details: [PROMT workflow](PROMT.md), [diagnostics architecture](docs/dev/DIAGNOS
 
 See the [game compatibility list](docs/user/COMPATIBILITY.md) for tested games and known issues.
 
+## Differences from upstream
+
+This fork is based on upstream [AnyPS5](https://github.com/boykopovar/AnyPS5) plus its own work:
+
+- Prepare-and-launch toolchain: `tools/preflight.py`, `tools/inspect_executable.py`, `tools/plan.py`, `tools/run_game.py` (plus `.ps1`/`.sh` wrappers), `tools/capabilities.py`, `tools/vulkan_check.py`, and the `self_inspector` SELF converter — staged workflow `PREFLIGHT → RELINK → RUNTIME_START → GAME_RUNNING` (see `PROMT.md`, `docs/dev/DIAGNOSTICS.md`).
+- Windows game launcher (`launcher/`, ImGui + Win32 + DirectX 11): game library, covers, themes, system-wide F1 menu.
+- CPU packet-execution backend for the graphics driver (`CpuBackend/`, `ANYPS5_CPU_BACKEND=legacy|fast|auto`), CPU fallback for depth-bounds tests (`APS5_DEPTH_BOUNDS=hardware|cpu|auto`), capability-driven unified memory (`GuestUnifiedMemory`).
+- Storage-texture write-back owner guard and TLSF-reuse guard in `Graphics/src/Texture.cpp` (kill switch `APS5_NO_REFRESH_FAST_PATH=1`).
+- Gamepad-only input (keyboard/mouse pad bindings removed) and a local tested-games table (`docs/user/COMPATIBILITY.md`).
+
 ## Input mapping
 
 SDL-mapped game controllers are supported, including analog sticks and triggers. The gamepad (Xbox/PS layout via SDL_GameController) is the only pad input; keyboard/mouse pad bindings were removed. The window starts in fullscreen and the title shows only FPS. See [input mapping](docs/user/INPUT_MAPPING.md) for the controller layout.
