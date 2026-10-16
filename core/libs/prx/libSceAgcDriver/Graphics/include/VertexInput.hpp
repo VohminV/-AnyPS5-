@@ -22,7 +22,11 @@ struct VertexFormat {
 
 inline bool NullVertexDescriptor(const ShaderRecompiler::VertexAttribute& attribute) {
     const auto& fields = attribute.resource.fields;
-    return fields[0] == 0 && fields[1] == 0 && fields[2] == 0 && fields[3] == 0;
+    // A fully-zeroed V# is the classic null. A V# with num_records=0 is also
+    // unfetchable: the guest declares more interleaved semantics than it binds
+    // for this draw and leaves empty odd slots ({0, 0x7000xx, 0, 0}) that carry
+    // no data.
+    return fields[2] == 0 || (fields[0] == 0 && fields[1] == 0 && fields[2] == 0 && fields[3] == 0);
 }
 
 inline VertexFormat DecodeVertexFormat(const ShaderRecompiler::VertexAttribute& attribute) {
@@ -35,6 +39,7 @@ inline VertexFormat DecodeVertexFormat(const ShaderRecompiler::VertexAttribute& 
     Require(components >= 1u && components <= 4u, "invalid vertex format component count");
     const auto format = (attribute.resource.fields[3] >> 12u) & 0x7fu;
     switch (format) {
+        case 0: { const std::array formats{VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT}; const auto count = std::min(components, 4u); return {formats[count - 1], count * 4u, 4u, "f32"}; }
         case 1: { const std::array formats{VK_FORMAT_R8_UNORM}; const auto count = std::min(components, 1u); return {formats[count - 1], count * 1u, 1u, "f32"}; }
         case 2: { const std::array formats{VK_FORMAT_R8_SNORM}; const auto count = std::min(components, 1u); return {formats[count - 1], count * 1u, 1u, "f32"}; }
         case 3: { const std::array formats{VK_FORMAT_R8_USCALED}; const auto count = std::min(components, 1u); return {formats[count - 1], count * 1u, 1u, "f32"}; }

@@ -5,11 +5,14 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -184,12 +187,35 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
     if (vertexBufferReg < 0) throw std::runtime_error("AGC graphics: vertex attribute table requires a vertex buffer table");
     if (static_cast<std::uint32_t>(vertexBufferReg) + 1u >= userData.size()) throw std::runtime_error("AGC graphics: vertex buffer table pointer exceeds the user-SGPR domain");
     if (static_cast<std::uint32_t>(vertexAttribReg) + 1u >= userData.size()) throw std::runtime_error("AGC graphics: vertex attribute table pointer exceeds the user-SGPR domain");
+    // Rate-limited per-header decode dump: first decode of each unique header
+    // address prints everything (user-SGPRs, all semantics, all sharps). A
+    // register-write list vs a V# table is then visible from one log entry.
+    static std::mutex seenHeadersMutex;
+    static std::vector<std::uint64_t> seenHeaders;
+    bool dumpVertex = false;
+    if (!staticAbi) {
+        std::lock_guard lock(seenHeadersMutex);
+        if (std::find(seenHeaders.begin(), seenHeaders.end(), headerAddress) == seenHeaders.end() && seenHeaders.size() < 64) {
+            seenHeaders.push_back(headerAddress);
+            dumpVertex = true;
+        }
+    }
+    if (dumpVertex) {
+        std::fprintf(stderr, "[vertex-decode] header=0x%llx direct_count=%u buffer_reg=%d attrib_reg=%d\n",
+                     static_cast<unsigned long long>(headerAddress), static_cast<unsigned>(userDataHeader.direct_resource_count), vertexBufferReg, vertexAttribReg);
+        std::fprintf(stderr, "[vertex-decode] direct_offsets:");
+        for (std::uint32_t type = 0; type < userDataHeader.direct_resource_count; ++type) std::fprintf(stderr, " [%u]=%u", type, static_cast<unsigned>(directOffsets[type]));
+        std::fprintf(stderr, "\n[vertex-decode] user_data(%zu):", userData.size());
+        for (std::size_t i = 0; i < userData.size(); ++i) std::fprintf(stderr, " [%zu]=0x%x", i, userData[i]);
+        std::fprintf(stderr, "\n");
+    }
     if (shader.num_input_semantics == 0 || shader.num_input_semantics > ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex semantic count is outside the supported domain");
     if (shader.input_semantics == nullptr) throw std::runtime_error("AGC graphics: missing vertex input semantics");
     std::array<ShaderSemantic, ShaderRecompiler::ShaderVertexStageInfo::MaxResources> semantics{};
     _readHeaderArray(header, headerAddress, shader.input_semantics, shader.num_input_semantics, semantics.data());
     const auto attribTableAddr = static_cast<std::uint64_t>(userData[static_cast<std::uint32_t>(vertexAttribReg)]) | (static_cast<std::uint64_t>(userData[static_cast<std::uint32_t>(vertexAttribReg) + 1u]) << 32u);
     const auto bufferTableAddr = static_cast<std::uint64_t>(userData[static_cast<std::uint32_t>(vertexBufferReg)]) | (static_cast<std::uint64_t>(userData[static_cast<std::uint32_t>(vertexBufferReg) + 1u]) << 32u);
+    if (dumpVertex) std::fprintf(stderr, "[vertex-decode] attrib_table=0x%llx buffer_table=0x%llx semantics=%u\n", static_cast<unsigned long long>(attribTableAddr), static_cast<unsigned long long>(bufferTableAddr), static_cast<unsigned>(shader.num_input_semantics));
     if (!staticAbi && attribTableAddr == 0) throw std::runtime_error("AGC graphics: null vertex attribute table address");
     if (!staticAbi && bufferTableAddr == 0) throw std::runtime_error("AGC graphics: null vertex buffer table address");
     info.fetchEmbedded = true;
@@ -222,6 +248,15 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const st
         if (reads != nullptr) reads->push_back({sharpAddress, {sharpBytes.begin(), sharpBytes.end()}});
         std::array<std::uint32_t, 4> sharp{};
         std::memcpy(sharp.data(), sharpBytes.data(), 16);
+        if (dumpVertex) std::fprintf(stderr, "[vertex-decode] semantic=%u attr_word=0x%x (index=%u format=%u offset=%u) attrib@0x%llx sharp@0x%llx = {0x%x, 0x%x, 0x%x, 0x%x}\n", static_cast<unsigned>(semantic.semantic), attribWord, static_cast<unsigned>(index), static_cast<unsigned>(format), static_cast<unsigned>(offset), static_cast<unsigned long long>(attribWordAddress), static_cast<unsigned long long>(sharpAddress), sharp[0], sharp[1], sharp[2], sharp[3]);
+        // A live V# holds a guest address (high 16 bits of fields[1] in the
+        // 0x12xx guest-VA range here); a torn/streaming pair instead yields a
+        // register offset in fields[0] (0x200..0x3ff userConfig bank). Dump
+        // those regardless of the first-N budget: this is the V# bug signature.
+        static std::atomic<std::uint64_t> tornSharpCount{0};
+        if (sharp[0] < 0x1000u && tornSharpCount.fetch_add(1, std::memory_order_relaxed) < 16) {
+            std::fprintf(stderr, "[vertex-decode] TORN-V# header=0x%llx semantic=%u attr_word=0x%x (index=%u format=%u offset=%u) attrib@0x%llx sharp@0x%llx = {0x%x, 0x%x, 0x%x, 0x%x} attrib_table=0x%llx buffer_table=0x%llx buffer_reg=%d attrib_reg=%d\n", static_cast<unsigned long long>(headerAddress), static_cast<unsigned>(semantic.semantic), attribWord, static_cast<unsigned>(index), static_cast<unsigned>(format), static_cast<unsigned>(offset), static_cast<unsigned long long>(attribWordAddress), static_cast<unsigned long long>(sharpAddress), sharp[0], sharp[1], sharp[2], sharp[3], static_cast<unsigned long long>(attribTableAddr), static_cast<unsigned long long>(bufferTableAddr), vertexBufferReg, vertexAttribReg);
+        }
         if (info.resourcesNum >= ShaderRecompiler::ShaderVertexStageInfo::MaxResources) throw std::runtime_error("AGC graphics: vertex resource count exceeds the supported domain");
         auto& resource = info.resources[info.resourcesNum];
         auto& destination = info.resourcesDst[info.resourcesNum];

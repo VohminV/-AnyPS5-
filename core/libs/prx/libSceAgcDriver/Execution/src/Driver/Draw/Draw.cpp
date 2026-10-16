@@ -145,6 +145,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         // rejection and continues the submission.
         try {
             vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i]);
+            static std::atomic<std::uint64_t> contextDumped{0};
+            if (contextDumped.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[vertex-decode] program=0x%llx first_user_sgpr=%u user_data_base=0x%x role=%u\n", static_cast<unsigned long long>(program.binary.codeAddress), program.firstUserSgpr, program.userDataBase, static_cast<unsigned>(roles[i]));
         } catch (const std::exception& error) {
             static std::atomic<std::uint64_t> decodeSkips{0};
             static std::atomic<std::uint64_t> decodeReported{0};

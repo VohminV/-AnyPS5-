@@ -287,19 +287,22 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
             size(6);
             require(packet[3] <= 0xffffu, "unsupported index address bits");
             require(packet[4] <= packet[1], "index count exceeds maximum index size");
-            require((packet[5] & ~0x20u) == 0, "unsupported indexed draw flags");
+            if ((packet[5] & ~0x20u) != 0)
+                std::fprintf(stderr, "[gpu] DRAW_INDEX_OFFSET flags=0x%x not fully supported, continuing\n", packet[5]);
             break;
         case 0x2a: graphics(); size(2); require(packet[1] <= 3, "unsupported index-type modifiers"); break;
         case 0x2d:
             graphics();
             size(3);
-            require((packet[2] & ~0x20u) == 2u, "unsupported auto draw flags");
+            if ((packet[2] & ~0x20u) != 2u)
+                std::fprintf(stderr, "[gpu] AUTO_DRAW flags=0x%x not fully supported, continuing\n", packet[2]);
             break;
         case 0x35:
             graphics();
             size(5);
             require(packet[3] <= packet[1], "index count exceeds maximum index size");
-            require((packet[4] & ~0x20u) == 0, "unsupported indexed draw flags");
+            if ((packet[4] & ~0x20u) != 0)
+                std::fprintf(stderr, "[gpu] DRAW_INDEX_OFFSET_2 flags=0x%x not fully supported, continuing\n", packet[4]);
             break;
         case 0x24: case 0x25:
             graphics();

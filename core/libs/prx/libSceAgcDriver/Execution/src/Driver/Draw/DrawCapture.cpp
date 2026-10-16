@@ -114,7 +114,7 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
                 static std::atomic<std::uint64_t> materializeSkips{0};
                 static std::atomic<std::uint64_t> materializeReported{0};
                 const auto total = materializeSkips.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (materializeReported.load(std::memory_order_relaxed) < 4) {
+                if (materializeReported.fetch_add(1, std::memory_order_relaxed) < 4) {
                     std::fprintf(stderr, "[gpu] rejected draw: draw materialization failed (%llu total): %s\n", static_cast<unsigned long long>(total), reason.c_str());
                 }
                 rejected = std::string("draw materialization: ") + reason;
