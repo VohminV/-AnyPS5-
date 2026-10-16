@@ -95,18 +95,45 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     // Attach the shader address to translation failures and dump the code for
     // offline replay (see DumpFailedShaderCode); the failure itself still
     // propagates unchanged.
+    //
+    // Playable rule, same as the capture above: materialization reads guest
+    // sampler/image words that may still be streaming garbage, and those
+    // failures reject this draw; compile and device errors stay fatal.
     try {
         stageCapture.compiled = invocation.Materialize(*capture);
-    } catch (const std::invalid_argument& error) {
-        DumpFailedShaderCode(program.binary.codeAddress, request.shader.code);
-        char where[32];
-        std::snprintf(where, sizeof(where), "0x%llx", static_cast<unsigned long long>(program.binary.codeAddress));
-        throw std::invalid_argument(std::string("shader ") + where + ": " + error.what());
-    } catch (const std::runtime_error& error) {
-        DumpFailedShaderCode(program.binary.codeAddress, request.shader.code);
-        char where[32];
-        std::snprintf(where, sizeof(where), "0x%llx", static_cast<unsigned long long>(program.binary.codeAddress));
-        throw std::runtime_error(std::string("shader ") + where + ": " + error.what());
+    } catch (const std::exception& error) {
+        if (dynamic_cast<const std::bad_alloc*>(&error) == nullptr) {
+            const std::string reason = error.what();
+            for (const char* marker : {"cannot query guest memory", "null or misaligned address",
+                                       "runtime image descriptor is invalid",
+                                       "DescriptorBindingBuilder::Populate",
+                                       "storage image access to depth/stencil surface",
+                                       "guest sampler descriptor ",
+                                       "guest texture descriptor "}) {
+                if (reason.find(marker) == std::string::npos) continue;
+                static std::atomic<std::uint64_t> materializeSkips{0};
+                static std::atomic<std::uint64_t> materializeReported{0};
+                const auto total = materializeSkips.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (materializeReported.load(std::memory_order_relaxed) < 4) {
+                    std::fprintf(stderr, "[gpu] rejected draw: draw materialization failed (%llu total): %s\n", static_cast<unsigned long long>(total), reason.c_str());
+                }
+                rejected = std::string("draw materialization: ") + reason;
+                return ShaderRecompiler::RecompileResult{};
+            }
+        }
+        try {
+            throw;
+        } catch (const std::invalid_argument& error) {
+            DumpFailedShaderCode(program.binary.codeAddress, request.shader.code);
+            char where[32];
+            std::snprintf(where, sizeof(where), "0x%llx", static_cast<unsigned long long>(program.binary.codeAddress));
+            throw std::invalid_argument(std::string("shader ") + where + ": " + error.what());
+        } catch (const std::runtime_error& error) {
+            DumpFailedShaderCode(program.binary.codeAddress, request.shader.code);
+            char where[32];
+            std::snprintf(where, sizeof(where), "0x%llx", static_cast<unsigned long long>(program.binary.codeAddress));
+            throw std::runtime_error(std::string("shader ") + where + ": " + error.what());
+        }
     }
     timing.Mark("materialize");
     ShaderRecompiler::RecompileResult result = *stageCapture.compiled;

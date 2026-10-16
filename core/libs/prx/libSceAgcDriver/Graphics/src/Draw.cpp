@@ -224,7 +224,12 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, Sto
     const auto metadataBytes = static_cast<std::uint64_t>(color.cmaskBytes) * 256u;
     const auto state = ProvedDrawDccKeys(color.cmaskAddress, metadataBytes);
     if (state == DccKeys::Uncompressed) return false;
-    Require(color.dccAddress == 0, std::string("CMASK of a DCC color target that is not all expanded is not modeled (") + DccKeysName(state) + ")");
+    // A fast-cleared CMASK over a DCC target: on hardware the CMASK clear wins
+    // for every tile (the DCC data of cleared tiles is don't-care until they
+    // expand), so the register clear is materialized into the texels and both
+    // metadata are expanded. Partly-cleared CMASK over DCC stays unmodeled.
+    const bool dccTarget = color.dccAddress != 0;
+    Require(!dccTarget || state == DccKeys::Clear0000, std::string("CMASK of a DCC color target that is not all expanded is not modeled (") + DccKeysName(state) + ")");
     Require(state == DccKeys::Clear0000, std::string("CMASK whose tiles are not all fast-cleared or all expanded is not modeled (") + DccKeysName(state) + ")");
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
     const char* refusal = nullptr;
@@ -234,6 +239,7 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, Sto
         if (resident != nullptr) resident->Refresh();
     }
     MarkDccUncompressed(context, color.cmaskAddress, metadataBytes);
+    if (dccTarget) MarkDccUncompressed(context, color.dccAddress, color.bytes, colorKeyCount(color, color.bytes));
     return true;
 }
 
@@ -1035,12 +1041,26 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         fetches.push_back({address, address + bytes, (fields[1] >> 16u) & 0x3fffu, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
     }
     const auto plan = PlanVertexCopies(fetches);
-    for (const auto& [begin, end] : plan.copies) {
-        const auto bytes = static_cast<std::size_t>(end - begin);
-        GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
-        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
-        KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
-        inputs.vertexBuffers.push_back(std::move(copy.buffer));
+    // Hacker rule, same as the per-fetch guard above: a copy range over an
+    // unreadable (garbage-descriptor) address skips this draw instead of
+    // terminating the process. Copies are abandoned whole: vertexBuffers must
+    // stay aligned with the plan's copy indices.
+    try {
+        for (const auto& [begin, end] : plan.copies) {
+            const auto bytes = static_cast<std::size_t>(end - begin);
+            GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
+            auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
+            KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
+            inputs.vertexBuffers.push_back(std::move(copy.buffer));
+        }
+    } catch (const std::exception& error) {
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::fprintf(stderr, "[gpu] vertex copy skip: %s\n", error.what());
+        }
+        inputs.nothing = true;
+        timer.phase(PhaseVertex);
+        return inputs;
     }
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         if (fetchOf[i] == noFetch) {
@@ -1128,7 +1148,11 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         for (const char* marker : {"aliases the render target", "aliases the index buffer",
                                    "cannot query guest memory", "null or misaligned address",
                                    "runtime image descriptor is invalid",
-                                   "DescriptorBindingBuilder::Populate"}) {
+                                   "DescriptorBindingBuilder::Populate",
+                                   "guest sampler descriptor ",
+                                   "guest texture descriptor ",
+                                   "storage image access to depth/stencil surface",
+                                   "exceeds descriptor range limit"}) {
             if (reason.find(marker) != std::string::npos) {
                 static std::atomic<int> lateReports{0};
                 if (lateReports.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -2324,7 +2348,11 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
             for (const char* marker : {"aliases the render target", "aliases the index buffer",
                                        "cannot query guest memory", "null or misaligned address",
                                        "runtime image descriptor is invalid",
-                                       "DescriptorBindingBuilder::Populate"}) {
+                                       "DescriptorBindingBuilder::Populate",
+                                       "guest sampler descriptor ",
+                                       "guest texture descriptor ",
+                                       "storage image access to depth/stencil surface",
+                                       "exceeds descriptor range limit"}) {
                 if (reason.find(marker) != std::string::npos) {
                     static std::atomic<int> recipeAliasReports{0};
                     if (recipeAliasReports.fetch_add(1, std::memory_order_relaxed) < 8) {

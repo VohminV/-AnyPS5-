@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestSamplerResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <array>
+#include <atomic>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -98,6 +100,13 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
         Require(!mcCoordTrunc, "guest sampler descriptor uses unnormalized coordinates with MC_COORD_TRUNC, which is not implemented");
     } else {
         Require(!unnormalizedProven, "guest sampler descriptor is bound as unnormalized without FORCE_UNNORMALIZED");
+    }
+    // Diagnostic: these two flags decide legit-vs-garbage for the skip
+    // reports below (a legit port descriptor has otherwise sane words).
+    // Placed before the rejections so both flag sets are reported.
+    static std::atomic<int> srgbReports{0};
+    if ((forceSrgb || disableDegamma) && srgbReports.fetch_add(1) < 4) {
+        std::fprintf(stderr, "[gpu] sampler sRGB/degamma flags: forceSrgb=%d disableDegamma=%d words=%08x %08x %08x %08x\n", forceSrgb ? 1 : 0, disableDegamma ? 1 : 0, words[0], words[1], words[2], words[3]);
     }
     Require(!forceSrgb, "guest sampler descriptor forces sRGB decoding which is not implemented");
     // TRUNC_COORD picks point-sampled texels by truncation instead of rounding, and the perf fields

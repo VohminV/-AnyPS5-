@@ -722,8 +722,12 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             auto& formatComponents = result.vertexAttributes.back().formatComponents;
             formatComponents = 1u;
             for (std::uint32_t component = 0; component < 4u; ++component) {
-                const auto selector = (input.outputMask & (1u << component)) != 0u ? (resource.fields[3] >> (component * 3u)) & 7u : 0u;
-                if (selector == 2u || selector == 3u) throw std::runtime_error("reserved prepared vertex component selector");
+                auto selector = (input.outputMask & (1u << component)) != 0u ? (resource.fields[3] >> (component * 3u)) & 7u : 0u;
+                // Reserved selectors read as zero on hardware, and the
+                // prepared attribute reader below already yields 0 for
+                // anything but 1 and 4-7: normalize instead of refusing
+                // shaders the title ships (menu/optimization vertex fetches).
+                if (selector == 2u || selector == 3u) selector = 0u;
                 if (selector >= 4u) formatComponents = std::max(formatComponents, selector - 3u);
                 selectors |= selector << (component * 3u);
             }

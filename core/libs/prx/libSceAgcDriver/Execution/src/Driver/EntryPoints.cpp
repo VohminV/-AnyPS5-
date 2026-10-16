@@ -13,6 +13,10 @@ void WaitIdle() {
     DriverDetail::Driver::Get().WaitIdle();
 }
 
+std::uint64_t DispatchesAdoptedAhead() {
+    return DriverDetail::Driver::Get().DispatchesAdoptedAhead();
+}
+
 void Shutdown() {
     DriverDetail::Driver::Get().Shutdown();
 }
@@ -72,6 +76,10 @@ extern "C" void AgcDriverUnlockVulkanLoader_nid_postfix() {
 
 extern "C" void AgcDriverShutdown_nid_postfix() {
     AgcDriver::Shutdown();
+}
+
+extern "C" std::uint64_t AgcDriverDispatchesAdoptedAhead_nid_postfix() {
+    return AgcDriver::DispatchesAdoptedAhead();
 }
 
 extern "C" void AgcDriverRegisterShader_nid_postfix(const Shader* shader) try {

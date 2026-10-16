@@ -2332,7 +2332,10 @@ DescriptorCache::Stats DescriptorCache::Counters() const {
 
 std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic) {
     Require(words.size() == 4, "buffer descriptor must contain four DWORDs");
-    Require((words[1] & 0x40000000u) == 0, "buffer descriptor has reserved bits set");
+    // Bit 30 is CACHE_SWIZZLE in SQ_BUF_RSRC_WORD1 (GCN through RDNA2), not a
+    // reserved bit: cache behavior has no host-side effect, so it is accepted
+    // like the other performance hints. Bit 31 (SWIZZLE_ENABLE) is decoded
+    // separately by ShaderBufferResource.
     const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
     Require(descriptor.Type() == 0u, "buffer descriptor uses an unsupported type");
     const auto address = descriptor.Base48();

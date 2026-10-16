@@ -36,6 +36,7 @@
 #include <sstream>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #if __has_include(<linux/fs.h>)
 #include <linux/fs.h>
 #endif
@@ -717,6 +718,17 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
     require(bytes <= std::numeric_limits<std::uintptr_t>::max() - address, "address range overflow");
     const auto reason = verify(address, bytes, writable);
     if (!reason.empty()) {
+        // TEMP-DIAG (revert after root-causing): caller file-offset via dladdr
+        // base (works without DWARF). Prints on every failed range check.
+        {
+            Dl_info info{};
+            const void* caller = __builtin_return_address(0);
+            const char* name = (dladdr(caller, &info) != 0 && info.dli_sname != nullptr) ? info.dli_sname : "?";
+            const auto base = info.dli_fbase != nullptr ? reinterpret_cast<std::uintptr_t>(info.dli_fbase) : 0u;
+            std::fprintf(stderr, "[tempdiag] CheckRange bytes=%zu addr=0x%llx caller=%s fileoff=0x%llx (%s)\n", bytes, static_cast<unsigned long long>(address), name,
+                         base != 0u ? static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(caller) - base) : 0ull,
+                         info.dli_fname != nullptr ? info.dli_fname : "?");
+        }
         // Debug aid: APS5_TRACE_UNREADABLE names the code that checked an inaccessible range.
         static const bool trace = std::getenv("APS5_TRACE_UNREADABLE") != nullptr;
         if (trace) std::fprintf(stderr, "[unreadable] %s from +0x%llx\n", reason.c_str(), ModuleOffset(__builtin_return_address(0)));

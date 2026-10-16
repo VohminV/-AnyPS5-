@@ -190,7 +190,7 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
                 failUnnormalized("samples an image selected at run time");
             }
             if ((image.dimension != RdnaImageDimension::Dim1D && image.dimension != RdnaImageDimension::Dim2D) || image.cube) {
-                failUnnormalized("samples a 1D-array, 2D-array, 3D, cube or multisampled image");
+                failUnnormalized(("samples a 1D-array, 2D-array, 3D, cube or multisampled image (dim " + std::to_string(static_cast<int>(image.dimension)) + (image.cube ? ", cube" : "") + ")").c_str());
             }
             if (image.depthCompare) {
                 failUnnormalized("is used with depth comparison");
