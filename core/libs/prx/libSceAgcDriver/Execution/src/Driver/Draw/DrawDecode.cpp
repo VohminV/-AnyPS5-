@@ -62,8 +62,15 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
         programs.reserve(5);
         roles.reserve(5);
         const auto append = [&](std::uint32_t base, std::uint8_t type, Stage stage, std::uint32_t resources, std::uint32_t users, Role role) {
-            programs.push_back(prepare(programAddress(base), type, stage, resources, users));
-            roles.push_back(role);
+            try {
+                programs.push_back(prepare(programAddress(base), type, stage, resources, users));
+                roles.push_back(role);
+            } catch (const std::runtime_error& error) {
+                if (std::string_view(error.what()).find("does not belong to a registered shader") != std::string_view::npos) {
+                    return;
+                }
+                throw;
+            }
         };
         const auto initializeMerged = [&](DrawProgram& program, std::uint32_t pointerBase, bool pointerRequired) {
             program.firstUserSgpr = 0;

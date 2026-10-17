@@ -130,7 +130,7 @@ void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inpu
                     const auto component = componentValue->ImmediateU32();
                     switch (kind) {
                         case StageInputKind::PackedAncillary:
-                            return Fail("packed pixel ancillary input has an unsupported live use");
+                            break;
                         case StageInputKind::Layer:
                         case StageInputKind::SampleId:
                             if (program.Resources().stage != IrShaderStage::Pixel || component != 0u) {
@@ -377,6 +377,8 @@ void CollectBuiltinInputs(const IrProgram& program, ShaderInfo& info) {
                     info.dispatchThreadLimit = true;
                     break;
                 case StageInputKind::PackedAncillary:
+                    AddInput(info, kind, 0, 1, "gl_PackedAncillary");
+                    break;
                 case StageInputKind::Parameter:
                     break;
             }

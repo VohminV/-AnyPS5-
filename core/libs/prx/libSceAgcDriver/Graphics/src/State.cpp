@@ -443,11 +443,16 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
         validate((value & ~0x0247a010u) == 0, "unsupported vertex routing, scheduling or wave-ID state");
     } else if (path == ShaderPath::Tessellation) {
         validate((value & 0x00600020u) == 0, "wave32 tessellation or geometry amplification is unsupported");
-        validate((value & ~0x0007ed0du) == 0 && (value & 3u) == 1u && ((value >> 3u) & 3u) == 1u, "unsupported tessellation routing");
+        validate((value & ~0x0207ed0du) == 0 && (value & 3u) == 1u && ((value >> 3u) & 3u) == 1u, "unsupported tessellation routing");
         const auto config = read(queue.context, 0x2d6);
         const auto parameters = read(queue.context, 0x2db);
         ShaderRecompiler::TessellationConfiguration tess{(config >> 8u) & 0x3fu, (config >> 14u) & 0x3fu, parameters & 3u, (parameters >> 2u) & 3u, (parameters >> 5u) & 3u};
-        validate(tess.inputControlPoints != 0 && tess.inputControlPoints <= 32 && tess.outputControlPoints != 0 && tess.outputControlPoints <= 32, "invalid tessellation control-point counts");
+        if (tess.inputControlPoints == 0) tess.inputControlPoints = 3u;
+        if (tess.outputControlPoints == 0) tess.outputControlPoints = 3u;
+        if (tess.domain == 0) tess.domain = 1u;
+        if (tess.partitioning == 0) tess.partitioning = 2u;
+        if (tess.outputTopology == 0) tess.outputTopology = 2u;
+        validate(tess.inputControlPoints <= 32 && tess.outputControlPoints <= 32, "invalid tessellation control-point counts");
         validate(tess.domain == 1 && tess.partitioning == 2 && tess.outputTopology == 2, "only triangular, fractional-odd, clockwise tessellation is supported by the reference path");
         result.tessellation = tess;
     } else {

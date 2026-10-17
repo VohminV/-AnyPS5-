@@ -343,6 +343,12 @@ int VideoOutDriver::SubmitFlip(int handle, int index, int flipMode, int64_t flip
     // A title that does not pace on flipPendingNum can run ahead of the presenter now that the queue
     // worker no longer waits per flip; a full queue is the documented error, not a failure.
     if (flipQueue->reservations.load() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
+    {
+        static unsigned long long submitCount = 0;
+        if (++submitCount <= 10 || submitCount % 600 == 0) {
+            std::fprintf(stderr, "[videoout] SubmitFlip #%llu handle=%d index=%d mode=%d arg=%lld\n", submitCount, handle, index, flipMode, static_cast<long long>(flipArg));
+        }
+    }
     std::array<uint32_t, AgcDriver::FlipPacketWords> words{AgcDriver::FlipPacketHeader, static_cast<uint32_t>(handle), static_cast<uint32_t>(index), static_cast<uint32_t>(flipMode), static_cast<uint32_t>(static_cast<uint64_t>(flipArg)), static_cast<uint32_t>(static_cast<uint64_t>(flipArg) >> 32u)};
     Packet packet{words.data(), static_cast<uint32_t>(words.size()), 0, {}};
     const auto result = sceAgcDriverSubmitDcb(&packet);
@@ -437,6 +443,12 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         AgcDriverPresentBuffer_nid_postfix(target, display, gpuReady, &req);
     } else {
         AgcDriverPresentClear_nid_postfix(target, req.index == VIDEO_OUT_BUFFER_INDEX_BLACK, gpuReady, &req);
+    }
+    {
+        static unsigned long long flipCount = 0;
+        if (++flipCount <= 5 || flipCount % 600 == 0) {
+            std::fprintf(stderr, "[videoout] present #%llu index=%d arg=%lld\n", flipCount, req.index, static_cast<long long>(req.flipArg));
+        }
     }
     timing.Mark("present");
     window.UpdateTitle();

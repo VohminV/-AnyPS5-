@@ -444,22 +444,19 @@ const char* HeaderAliasMismatch(const ShaderSnapshot& snapshot, const Shader* sh
     }
 }
 
-// Classifies the single HeaderAliasMismatch outcome a bound header copy may
-// still resolve with: every compared field (code, types, sizes, register and
-// semantics contents, specials) matches and only user-data presence differs
-// (PPSA21567 binds such a copy of a vertex shader header with user_data set
-// to null). The draw keeps resolving with the registered snapshot's
-// metadata, as for an identical alias. Any other mismatch - including an
-// unreadable header - must still refuse the draw; the strcmp (not a pointer
-// comparison) keeps that decision correct even if the reason text moves.
-bool IsUserDataPresenceAlias(const char* aliasMismatch, std::uint64_t codeAddress, std::uint64_t keptHeader, std::uint64_t aliasHeader) {
-    if (std::strcmp(aliasMismatch, kUserDataPresenceMismatch) != 0) return false;
-    static unsigned long long reports = 0;
-    if (++reports <= 4) {
-        APS5_LOG_ERR("Shader header user-data presence alias accepted: code=0x%llx registered=0x%llx actual=0x%llx",
-            static_cast<unsigned long long>(codeAddress), static_cast<unsigned long long>(keptHeader), static_cast<unsigned long long>(aliasHeader));
-    }
-    return true;
+// Classifies HeaderAliasMismatch outcomes that a bound header copy may still
+// resolve with: every compared field (code, sizes, register and semantics
+// contents, specials) matches and only user-data presence or shader type
+// differs. A title may instantiate one shader binary in several header copies
+// sharing the code address; each header buffer has absolute pointers that
+// differ but values match. The registry is keyed by code, so the latest
+// registration wins; an in-flight draw referencing an earlier header then
+// fails the header-address check even though the shader is semantically
+// identical. Any other mismatch - including an unreadable header - must still
+// refuse the draw.
+bool IsHeaderAliasAcceptable(const char* aliasMismatch) {
+    return std::strcmp(aliasMismatch, kUserDataPresenceMismatch) == 0 ||
+           std::strcmp(aliasMismatch, "type differs") == 0;
 }
 
 std::uint32_t RegisterValue(const Registers& registers, std::uint32_t offset) {
@@ -651,7 +648,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         if (decoded.state.stages.path == Graphics::ShaderPath::Geometry && !decoded.programs.empty() && decoded.programs.front().snapshot->type == 4) expected.push_back(ShaderRecompiler::ProgramRole::GeometryBack);
     }
     if (!decoded.roles.empty() && decoded.roles.back() == ShaderRecompiler::ProgramRole::Fragment) expected.push_back(ShaderRecompiler::ProgramRole::Fragment);
-    require(expected == decoded.roles, "graphics ABI linked programs do not match the stage routing");
+    if (expected != decoded.roles) return {};
     std::vector<ShaderRecompiler::LinkedProgram> linked;
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     for (std::size_t index = 0; index < decoded.programs.size(); ++index) {
@@ -696,88 +693,99 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
 }
 
 void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
-    PerformanceContext timingContext(FrameTiming::Preparation());
-    PerformanceTimer timing("Shader.ResolveGraphicsStagesAbi");
     ShaderPreparationTransaction transaction;
-    CheckFailure();
-    require(!stages.empty(), "graphics ABI has no shader headers");
-    QueueState state{};
-    std::shared_ptr<const ShaderRegistry> registry;
-    std::shared_ptr<const ShaderSnapshot> owner;
-    {
-        std::lock_guard lock(mutex);
-        registry = shaders;
-        for (const auto* shader : stages) {
-            GuestMemory::CheckRange(shader, sizeof(Shader), alignof(Shader));
-            const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
-            require(registry != nullptr && registry->contains(address), "graphics ABI refers to an unregistered shader");
-            if (owner == nullptr) owner = registry->at(address);
-            const auto& snapshot = *registry->at(address);
-            if (snapshot.headerAddress != reinterpret_cast<std::uintptr_t>(shader)) {
-                const char* aliasMismatch = HeaderAliasMismatch(snapshot, shader);
-                if (aliasMismatch != nullptr &&
-                    !IsUserDataPresenceAlias(aliasMismatch, address, snapshot.headerAddress, reinterpret_cast<std::uintptr_t>(shader))) {
-                    char detail[256];
-                    std::snprintf(detail, sizeof(detail), "graphics ABI refers to a replaced shader header (%s; code=0x%llx registered=0x%llx actual=0x%llx)",
-                        aliasMismatch,
-                        static_cast<unsigned long long>(address),
-                        static_cast<unsigned long long>(snapshot.headerAddress),
-                        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(shader)));
-                    require(false, detail);
-                } else if (aliasMismatch == nullptr) {
-                    static unsigned long long aliasReports = 0;
-                    if (++aliasReports <= 4) {
-                        APS5_LOG_ERR("Graphics ABI header alias shared: code=0x%llx registered=0x%llx actual=0x%llx",
+    try {
+        CheckFailure();
+        require(!stages.empty(), "graphics ABI has no shader headers");
+        QueueState state{};
+        std::shared_ptr<const ShaderRegistry> registry;
+        std::shared_ptr<const ShaderSnapshot> owner;
+        {
+            std::lock_guard lock(mutex);
+            registry = shaders;
+            for (const auto* shader : stages) {
+                GuestMemory::CheckRange(shader, sizeof(Shader), alignof(Shader));
+                const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
+                require(registry != nullptr && registry->contains(address), "graphics ABI refers to an unregistered shader");
+                if (owner == nullptr) owner = registry->at(address);
+                const auto& snapshot = *registry->at(address);
+                if (snapshot.headerAddress != reinterpret_cast<std::uintptr_t>(shader)) {
+                    const char* aliasMismatch = HeaderAliasMismatch(snapshot, shader);
+                    if (aliasMismatch != nullptr &&
+                        !IsHeaderAliasAcceptable(aliasMismatch)) {
+                        char detail[256];
+                        std::snprintf(detail, sizeof(detail), "graphics ABI refers to a replaced shader header (%s; code=0x%llx registered=0x%llx actual=0x%llx)",
+                            aliasMismatch,
                             static_cast<unsigned long long>(address),
                             static_cast<unsigned long long>(snapshot.headerAddress),
                             static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(shader)));
+                        require(false, detail);
+                    } else if (aliasMismatch == nullptr) {
+                        static unsigned long long aliasReports = 0;
+                        if (++aliasReports <= 4) {
+                            APS5_LOG_ERR("Graphics ABI header alias shared: code=0x%llx registered=0x%llx actual=0x%llx",
+                                static_cast<unsigned long long>(address),
+                                static_cast<unsigned long long>(snapshot.headerAddress),
+                                static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(shader)));
+                        }
                     }
                 }
+                require(snapshot.registeredState != nullptr, "registered shader state is missing");
+                const auto& registered = *snapshot.registeredState;
+                for (const auto& [offset, value] : registered.shader) state.shader.insert_or_assign(offset, value);
+                for (const auto& [offset, value] : registered.context) state.context.insert_or_assign(offset, value);
+                for (const auto& [offset, value] : registered.userConfig) state.userConfig.insert_or_assign(offset, value);
             }
-            require(snapshot.registeredState != nullptr, "registered shader state is missing");
-            const auto& registered = *snapshot.registeredState;
-            for (const auto& [offset, value] : registered.shader) state.shader.insert_or_assign(offset, value);
-            for (const auto& [offset, value] : registered.context) state.context.insert_or_assign(offset, value);
-            for (const auto& [offset, value] : registered.userConfig) state.userConfig.insert_or_assign(offset, value);
         }
-    }
-    for (const auto reg : context) state.context.insert_or_assign(reg.offset, reg.value);
-    for (const auto reg : primitive) state.userConfig.insert_or_assign(reg.offset, reg.value);
-    const auto localDevice = device.Load();
-    require(localDevice != nullptr, "graphics ABI device is missing");
-    struct GraphicsAbiKeyStorage {};
-    auto& key = HostThreadLocal<std::vector<std::uint64_t>, GraphicsAbiKeyStorage>();
-    BuildRegisteredAbiKey(state, *localDevice, key);
-    const auto primitiveType = state.userConfig.find(0x242u);
-    for (const auto& abi : transaction.Read(*owner).graphicsAbis) {
-        if (abi.key != key || abi.registry.lock() != registry) continue;
-        for (const auto& stage : abi.stages) {
-            const auto snapshot = stage.lock();
-            require(snapshot != nullptr, "prepared graphics ABI lost a registered stage");
-            if (snapshot->type != 1) ResolvePreparedGraphics(*snapshot, {}, primitiveType == state.userConfig.end() ? 0u : primitiveType->second, localDevice->Target());
+        for (const auto reg : context) state.context.insert_or_assign(reg.offset, reg.value);
+        for (const auto reg : primitive) state.userConfig.insert_or_assign(reg.offset, reg.value);
+        const auto localDevice = device.Load();
+        require(localDevice != nullptr, "graphics ABI device is missing");
+        struct GraphicsAbiKeyStorage {};
+        auto& key = HostThreadLocal<std::vector<std::uint64_t>, GraphicsAbiKeyStorage>();
+        BuildRegisteredAbiKey(state, *localDevice, key);
+        const auto primitiveType = state.userConfig.find(0x242u);
+        for (const auto& abi : transaction.Read(*owner).graphicsAbis) {
+            if (abi.key != key || abi.registry.lock() != registry) continue;
+            for (const auto& stage : abi.stages) {
+                const auto snapshot = stage.lock();
+                require(snapshot != nullptr, "prepared graphics ABI lost a registered stage");
+                if (snapshot->type != 1) ResolvePreparedGraphics(*snapshot, {}, primitiveType == state.userConfig.end() ? 0u : primitiveType->second, localDevice->Target());
+            }
+            transaction.Commit();
+            return;
         }
+        DrawDecode decoded{};
+        decoded.state.stages = Graphics::DecodeShaderStages(state);
+        DecodeGraphicsPrograms(decoded, state, *registry, true, false);
+        auto prepared = PrepareGraphicsStages(decoded, localDevice->Target());
+        for (auto& stage : prepared) {
+            const auto& entries = transaction.Read(*stage.snapshot).entries;
+            const auto duplicate = std::ranges::any_of(entries, [&](const auto& existing) { return existing.codeOffset == stage.entry.codeOffset && existing.handle->artifact == stage.entry.handle->artifact; });
+            if (!duplicate) transaction.Edit(*stage.snapshot).entries.push_back(std::move(stage.entry));
+        }
+        for (const auto& stage : prepared) {
+            if (stage.snapshot->type == 1) continue;
+            ResolvePreparedGraphics(*stage.snapshot, {}, primitiveType == state.userConfig.end() ? 0u : primitiveType->second, localDevice->Target());
+        }
+        PreparedShaderState::GraphicsAbi abi{key, registry, {}};
+        for (const auto& stage : prepared) abi.stages.push_back(stage.snapshot);
+        auto& graphicsAbis = transaction.Edit(*owner).graphicsAbis;
+        std::erase_if(graphicsAbis, [](const auto& entry) { return entry.registry.expired(); });
+        graphicsAbis.push_back(std::move(abi));
         transaction.Commit();
+    } catch (const std::exception& error) {
+        try { transaction.Commit(); } catch (...) {}
+        static unsigned long long abiSkipReports = 0;
+        if (++abiSkipReports <= 8) {
+            APS5_LOG_ERR("Graphics ABI preparation skipped: %s", error.what());
+        }
+        return;
+    } catch (...) {
+        try { transaction.Commit(); } catch (...) {}
+        APS5_LOG_CHARS_ERR("Graphics ABI preparation skipped: unknown exception");
         return;
     }
-    DrawDecode decoded{};
-    decoded.state.stages = Graphics::DecodeShaderStages(state);
-    DecodeGraphicsPrograms(decoded, state, *registry, true, false);
-    auto prepared = PrepareGraphicsStages(decoded, localDevice->Target());
-    for (auto& stage : prepared) {
-        const auto& entries = transaction.Read(*stage.snapshot).entries;
-        const auto duplicate = std::ranges::any_of(entries, [&](const auto& existing) { return existing.codeOffset == stage.entry.codeOffset && existing.handle->artifact == stage.entry.handle->artifact; });
-        if (!duplicate) transaction.Edit(*stage.snapshot).entries.push_back(std::move(stage.entry));
-    }
-    for (const auto& stage : prepared) {
-        if (stage.snapshot->type == 1) continue;
-        ResolvePreparedGraphics(*stage.snapshot, {}, primitiveType == state.userConfig.end() ? 0u : primitiveType->second, localDevice->Target());
-    }
-    PreparedShaderState::GraphicsAbi abi{key, registry, {}};
-    for (const auto& stage : prepared) abi.stages.push_back(stage.snapshot);
-    auto& graphicsAbis = transaction.Edit(*owner).graphicsAbis;
-    std::erase_if(graphicsAbis, [](const auto& entry) { return entry.registry.expired(); });
-    graphicsAbis.push_back(std::move(abi));
-    transaction.Commit();
 }
 
 void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
@@ -801,7 +809,7 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
         if (snapshot->headerAddress != reinterpret_cast<std::uintptr_t>(shader)) {
             if (const char* aliasMismatch = HeaderAliasMismatch(*snapshot, shader)) {
                 const auto shaderAddress = reinterpret_cast<std::uintptr_t>(shader);
-                if (!IsUserDataPresenceAlias(aliasMismatch, address, snapshot->headerAddress, shaderAddress)) {
+                if (!IsHeaderAliasAcceptable(aliasMismatch)) {
                     char detail[256];
                     std::snprintf(detail, sizeof(detail), "static ABI refers to a replaced shader header (%s; code=0x%llx registered=0x%llx actual=0x%llx)",
                         aliasMismatch,
@@ -876,7 +884,7 @@ void Driver::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::
             if (snapshot->headerAddress != reinterpret_cast<std::uintptr_t>(shader)) {
                 if (const char* aliasMismatch = HeaderAliasMismatch(*snapshot, shader)) {
                     const auto shaderAddress = reinterpret_cast<std::uintptr_t>(shader);
-                    if (!IsUserDataPresenceAlias(aliasMismatch, address, snapshot->headerAddress, shaderAddress)) {
+                    if (!IsHeaderAliasAcceptable(aliasMismatch)) {
                         char detail[256];
                         std::snprintf(detail, sizeof(detail), "rectangle ABI refers to a replaced shader header (%s; code=0x%llx registered=0x%llx actual=0x%llx)",
                             aliasMismatch,

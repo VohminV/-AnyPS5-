@@ -91,6 +91,39 @@ int main() {
                 }
             }
         }
+        // Regression: PR #2293 — patch/hull mismatch skips ABI preparation but
+        // still returns the packed registers.
+        {
+            std::array<ShaderRegister, 3> ctx{};
+            std::array<ShaderRegister, 3> prim{};
+            ctx.back().value = prim.back().value = 0xdeadbeef;
+
+            // Patch primitive (9) without HS_EN: mismatch -> skip ABI preparation.
+            preparations = 0;
+            Require(sceAgcCreatePrimState(ctx.data(), prim.data(), nullptr, &vertex, 9) == 0);
+            Require(preparations == 0);
+            Require(ctx[0].offset == VGT_SHADER_STAGES_EN && ctx[0].value == 0);
+            Require(ctx[1].offset == VGT_GS_OUT_PRIM_TYPE && ctx[1].value == 2);
+            Require(prim[0].offset == GE_CNTL && prim[0].value == 0x123);
+            Require(prim[1].offset == GE_USER_VGPR_EN && prim[1].value == 7);
+            Require(prim[2].offset == VGT_PRIMITIVE_TYPE && prim[2].value == 9);
+
+            // Patch primitive (9) with HS_EN: match -> perform ABI preparation.
+            special.vgt_shader_stages_en.value = VGT_SHADER_STAGES_HS_BIT;
+            preparations = 0;
+            Require(sceAgcCreatePrimState(ctx.data(), prim.data(), nullptr, &vertex, 9) == 0);
+            Require(preparations == 1);
+            Require(ctx[0].value == VGT_SHADER_STAGES_HS_BIT);
+            special.vgt_shader_stages_en.value = 0;
+
+            // Non-patch primitive (4) with HS_EN: mismatch -> skip ABI preparation.
+            special.vgt_shader_stages_en.value = VGT_SHADER_STAGES_HS_BIT;
+            preparations = 0;
+            Require(sceAgcCreatePrimState(ctx.data(), prim.data(), nullptr, &vertex, 4) == 0);
+            Require(preparations == 0);
+            Require(ctx[0].value == VGT_SHADER_STAGES_HS_BIT);
+            special.vgt_shader_stages_en.value = 0;
+        }
         std::array<ShaderRegister, 34> linkedContext{};
         std::array<ShaderRegister, 3> linkedPrimitive{};
         for (auto& value : linkedContext) value.value = 0xdeadbeef;
