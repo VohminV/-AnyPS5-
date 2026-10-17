@@ -98,6 +98,12 @@ std::optional<CompiledVariant> AotCache::Lookup(std::uint64_t hash) {
     CompiledVariant variant;
     if (ShaderDiskCache::DecodeEntry(file, key, variant) != ShaderDiskCache::LoadStatus::Loaded)
         return std::nullopt;
+    // Проверяем магическое число SPIR-V — защита от невалидного кэша
+    // (например, после неудачного re-spirv сжатия).
+    if (variant.artifact.spirv.empty() || variant.artifact.spirv[0] != 0x07230203u) {
+        std::fprintf(stderr, "[aot-cache] invalid SPIR-V magic in cache entry, skipping\n");
+        return std::nullopt;
+    }
     return variant;
 }
 

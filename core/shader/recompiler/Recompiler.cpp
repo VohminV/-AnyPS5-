@@ -814,6 +814,21 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
     return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
 }
 
+// Проверяет, совместим ли кэшированный IrBindingLayout (из AOT кэша) с текущим
+// запросом. Если кэшированный layout использует push data (UsesPushData == true),
+// но текущий pushConstantSizeBytes слишком мал для хранения shader data,
+// кэш не подходит — нужна полная компиляция.
+bool IsAotLayoutCompatible(const CompiledVariant& variant, const BindingLayout& request) {
+    const auto& prepared = variant.bindings.layout;
+    if (prepared.UsesPushData()) {
+        const auto words = prepared.ShaderDataDwords();
+        if (prepared.runtimeImageCount != 0u || words == 0u || words > request.pushConstantSizeBytes / 4u) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, bool& cacheHit) {
     for (const auto& candidate : source.variants) {
         if (sameLayout(candidate->layout, request.layout)) {
@@ -839,12 +854,18 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     }
     if (variant == nullptr && AotCache::Enabled()) {
         if (auto loaded = AotCache::Lookup(AotCache::HashCode(request.shader.code, request.layout)); loaded.has_value()) {
-            loaded->layout = request.layout;
-            loaded->bindings.pushConstantOffsetBytes = request.layout.pushConstantOffsetBytes;
-            loaded->bindings.pushConstantSizeBytes = request.layout.pushConstantSizeBytes;
-            loaded->artifact.variantId = nextVariantId();
-            variant = std::make_shared<const CompiledVariant>(std::move(*loaded));
-            std::fprintf(stderr, "[aot-cache] hit code=0x%08x words=%zu\n", request.shader.codeAddress, variant->artifact.spirv.size());
+            if (!IsAotLayoutCompatible(*loaded, request.layout)) {
+                // Кэшированный layout не совместим с текущим запросом —
+                // делаем полную компиляцию вместо использования кэша.
+                std::fprintf(stderr, "[aot-cache] layout-incompatible code=0x%08x, recompiling\n", request.shader.codeAddress);
+            } else {
+                loaded->layout = request.layout;
+                loaded->bindings.pushConstantOffsetBytes = request.layout.pushConstantOffsetBytes;
+                loaded->bindings.pushConstantSizeBytes = request.layout.pushConstantSizeBytes;
+                loaded->artifact.variantId = nextVariantId();
+                variant = std::make_shared<const CompiledVariant>(std::move(*loaded));
+                std::fprintf(stderr, "[aot-cache] hit code=0x%08x words=%zu\n", request.shader.codeAddress, variant->artifact.spirv.size());
+            }
         } else {
             std::fprintf(stderr, "[aot-cache] miss code=0x%08x words=%zu\n", request.shader.codeAddress, request.shader.code.size());
         }
@@ -906,7 +927,7 @@ RecompileResult RecompileImpl(const RecompileRequest& request) {
     const auto source = getSource(request);
     materializer.Materialize(*source->plan, runtime, snapshot);
     if (!request.useCache) {
-        if (aotVariant.has_value()) {
+        if (aotVariant.has_value() && IsAotLayoutCompatible(*aotVariant, request.layout)) {
             aotVariant->layout = request.layout;
             aotVariant->bindings.pushConstantOffsetBytes = request.layout.pushConstantOffsetBytes;
             aotVariant->bindings.pushConstantSizeBytes = request.layout.pushConstantSizeBytes;
@@ -920,7 +941,7 @@ RecompileResult RecompileImpl(const RecompileRequest& request) {
         if (AotCache::Enabled()) AotCache::Store(AotCache::HashCode(request.shader.code, request.layout), variant);
         return result;
     }
-    if (aotVariant.has_value()) {
+    if (aotVariant.has_value() && IsAotLayoutCompatible(*aotVariant, request.layout)) {
         aotVariant->layout = request.layout;
         aotVariant->bindings.pushConstantOffsetBytes = request.layout.pushConstantOffsetBytes;
         aotVariant->bindings.pushConstantSizeBytes = request.layout.pushConstantSizeBytes;
