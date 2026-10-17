@@ -129,10 +129,22 @@ void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inpu
                     const auto kind = static_cast<StageInputKind>(kindValue->ImmediateU32());
                     const auto component = componentValue->ImmediateU32();
                     switch (kind) {
-                        case StageInputKind::PackedAncillary:
-                            break;
+                        case StageInputKind::PackedAncillary: {
+                            std::string uses;
+                            for (const IrValue* user : inst->Uses()) {
+                                uses += uses.empty() ? " (used by " : ", ";
+                                uses += IrOpcodeName(user->Opcode());
+                                for (std::size_t i = 1; i < user->ArgumentCount(); ++i) {
+                                    const IrValue* argument = user->Argument(i)->Resolve();
+                                    uses += argument->HasImmediate() && argument->Type() == IrType::U32 ? " " + std::to_string(argument->ImmediateU32()) : " ?";
+                                }
+                            }
+                            return Fail("packed pixel ancillary input has an unsupported live use" + uses + (uses.empty() ? "" : ")"));
+                        }
                         case StageInputKind::Layer:
                         case StageInputKind::SampleId:
+                        case StageInputKind::RasterPrimitive:
+                        case StageInputKind::LayerExported:
                             if (program.Resources().stage != IrShaderStage::Pixel || component != 0u) {
                                 return Fail("typed pixel scalar input is invalid");
                             }
@@ -375,6 +387,12 @@ void CollectBuiltinInputs(const IrProgram& program, ShaderInfo& info) {
                     break;
                 case StageInputKind::DispatchThreadLimit:
                     info.dispatchThreadLimit = true;
+                    break;
+                case StageInputKind::RasterPrimitive:
+                    info.rasterPrimitive = true;
+                    break;
+                case StageInputKind::LayerExported:
+                    info.layerExported = true;
                     break;
                 case StageInputKind::PackedAncillary:
                     AddInput(info, kind, 0, 1, "gl_PackedAncillary");

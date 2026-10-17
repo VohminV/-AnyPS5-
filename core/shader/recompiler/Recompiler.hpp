@@ -107,6 +107,13 @@ enum class ConservativeZExport : std::uint8_t {
     GreaterThanZ
 };
 
+enum class RasterPrimitive : std::uint8_t {
+    Point,
+    Line,
+    Triangle,
+    Rectangle
+};
+
 struct ShaderPixelStageInfo {
     std::uint32_t interpolatorCount;
     std::array<std::uint32_t, 32> interpolatorSettings;
@@ -132,6 +139,8 @@ struct ShaderPixelStageInfo {
     bool orderedPixelShader;
     std::array<std::uint8_t, 8> targetOutputMode;
     std::array<std::uint8_t, 8> targetExportMapping;
+    RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
+    bool layerExported = false;
 };
 
 struct ShaderVertexBufferResource {

@@ -118,6 +118,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 const auto stamp = ++eventSerial;
                 const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
                 if (reason == 0 || reason == 1 || reason == 5 || reason == 6) noteLabelStore(store->address, bytes, stamp, submission.queue);
+                if (reason == 0 || reason == 1 || reason == 5 || reason == 6) Pm4::NoteDmaImmediateFill(packet);
                 if (reason == 0 || reason == 5 || reason == 6) {
                     if (reason == 0) ++storesOnGpu;
                     else ++storesBehindCompletions;

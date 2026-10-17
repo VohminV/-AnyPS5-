@@ -831,19 +831,6 @@ private:
         DescriptorSource descriptor;
         MakeSource(*handle, width, sampler, sampleAdjust, descriptor);
         std::uint32_t badDword = 0;
-        if (expected == IrOpcode::GetImageResource) {
-            for (; badDword < descriptor.dwordCount; badDword++) {
-                const IrValue* value2 = descriptor.dwords[badDword]->Resolve();
-                if (value2->Opcode() == IrOpcode::ReadConstBuffer) {
-                    // Scalar-loaded image dwords are only legal via the bindless-table
-                    // plan (TryMakeTableImage); a direct descriptor here means the table
-                    // pattern did not match. Keep rejecting (no dummy texture) but name
-                    // the recovery knob for the next log.
-                    fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value at pc 0x" + formatHex32(usePc) + "; type " + TypeToString(value2->Type()) + "; chain: " + describeValueChain(descriptor.dwords[badDword], 8u) + " (scalar-loaded image descriptor without a bindless table; rerun with APS5_TRACE_BINDLESS=1 for the materializer reason)");
-                }
-            }
-            badDword = 0;
-        }
         if (!ValidateSource(descriptor, badDword)) {
             const IrValue* bad = descriptor.dwords[badDword]->Resolve();
             // Reason, not just the chain: type mismatch vs divergent Phi vs other.

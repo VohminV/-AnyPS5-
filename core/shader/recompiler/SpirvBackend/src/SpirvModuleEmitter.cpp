@@ -6,6 +6,7 @@
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 #include "PipelineSpecialization.hpp"
+#include "Recompiler.hpp"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -43,6 +44,12 @@ std::uint32_t EmitBuiltinU32(SpirvEmitterState& state, StageInputKind kind, std:
     }
     if (kind == StageInputKind::DispatchThreadLimit) {
         return EmitShaderDataDwordLoad(state, state.program.Metadata().bindings.DispatchThreadLimitDword() + component);
+    }
+    if (kind == StageInputKind::RasterPrimitive) {
+        return state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::RasterPrimitive, static_cast<std::uint32_t>(RasterPrimitive::Triangle));
+    }
+    if (kind == StageInputKind::LayerExported) {
+        return state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::LayerExported, 0u);
     }
     if (state.laneCount == 2 && (kind == StageInputKind::LocalInvocationId || kind == StageInputKind::GlobalInvocationId)) {
         const auto* workgroup = ShaderWorkgroupInputFor(state);

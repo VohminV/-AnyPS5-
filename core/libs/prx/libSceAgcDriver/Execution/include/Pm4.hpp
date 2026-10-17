@@ -142,6 +142,11 @@ struct MemoryCopy {
     std::size_t bytes;
 };
 std::optional<MemoryCopy> DecodeMemoryCopy(std::span<const std::uint32_t> packet);
+// A DMA_DATA immediate fill of a surface's DCC keys with one key byte (GTA V clears its bloom
+// target this way every frame) is a key fill like the title's fill kernel: the surface learns of it
+// even when the keys already held that value, so the next refresh clears its results instead of
+// drawing over last frame's. No-op for any other packet; APS5_NO_DMA_KEYS_FILL=1 off.
+void NoteDmaImmediateFill(std::span<const std::uint32_t> packet);
 // A DISPATCH_INDIRECT's arguments: the guest address of its three group-count dwords (no memory
 // access, so the GPU can read them in place: VulkanDevice::DispatchIndirect), the DISPATCH_DIRECT
 // packet made by reading them there (through the checked guest memory path, which waits for

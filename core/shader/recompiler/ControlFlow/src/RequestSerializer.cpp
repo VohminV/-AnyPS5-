@@ -235,6 +235,14 @@ ConservativeZExport readConservativeZExport(Reader& reader) {
     return static_cast<ConservativeZExport>(value);
 }
 
+RasterPrimitive readRasterPrimitive(Reader& reader) {
+    const auto value = reader.ReadU8();
+    if (value > static_cast<std::uint8_t>(RasterPrimitive::Rectangle)) {
+        throw std::runtime_error("RequestSerializer: invalid RasterPrimitive value");
+    }
+    return static_cast<RasterPrimitive>(value);
+}
+
 void writeShaderBinary(Writer& writer, const ShaderBinary& binary) {
     writer.WriteU8(static_cast<std::uint8_t>(binary.stage));
     writer.WriteU64(binary.codeAddress);
@@ -312,6 +320,8 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
     for (const std::uint8_t value : info.targetExportMapping) {
         writer.WriteU8(value);
     }
+    writer.WriteU8(static_cast<std::uint8_t>(info.rasterPrimitive));
+    writer.WriteBool(info.layerExported);
 }
 
 ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
@@ -360,6 +370,10 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
             input(PixelInput::PositionX, info.posX) | input(PixelInput::PositionY, info.posY) | input(PixelInput::PositionZ, info.posZ) | input(PixelInput::PositionW, info.posW) |
             input(PixelInput::FrontFace, info.frontFace) | input(PixelInput::Ancillary, info.ancillary);
         if (info.sampleShading) info.inputAddr |= PixelInputBit(PixelInput::PerspectiveSample);
+    }
+    if (version >= 14u) {
+        info.rasterPrimitive = readRasterPrimitive(reader);
+        info.layerExported = reader.ReadBool();
     }
     return info;
 }
@@ -714,7 +728,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(13u);
+    writer.WriteU32(14u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -741,7 +755,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 13u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 14u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);

@@ -116,6 +116,9 @@ struct SpirvEmitterState {
     std::uint32_t bdaStopValue = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;
+    // True while a loop's continue target is emitted: an inactive runtime image mode there cannot
+    // branch to OpUnreachable (it would break the latch), so it joins with an undefined value.
+    bool continueTarget = false;
     // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across
     // host invocations (see WaveLdsScope); 0 when none are emitted.
     std::uint32_t waveLdsScope = 0;

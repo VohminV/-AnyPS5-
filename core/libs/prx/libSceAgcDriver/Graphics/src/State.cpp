@@ -609,6 +609,7 @@ State DecodeState(const QueueState& queue) {
     }
     if (result.hasColorTarget) {
         result.color = result.colors.front();
+        result.layerExports = read(cx, 0x207) & (1u << 18u);
         if (result.depth) result.renderExtent = {std::min(result.renderExtent.width, result.depth->extent.width), std::min(result.renderExtent.height, result.depth->extent.height)};
     } else if (result.depth) {
         result.renderExtent = result.depth->extent;
@@ -686,6 +687,17 @@ std::array<std::uint8_t, 8> ExportMappings(const State& state) {
         if (color.exportIndex < mappings.size()) mappings[color.exportIndex] = color.componentMapping;
     }
     return mappings;
+}
+
+ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state) {
+    if (state.rectList) return ShaderRecompiler::RasterPrimitive::Rectangle;
+    if (state.stages.mesh.has_value() || state.stages.tessellation.has_value()) return ShaderRecompiler::RasterPrimitive::Triangle;
+    switch (state.topology) {
+        case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return ShaderRecompiler::RasterPrimitive::Point;
+        case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+        case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: return ShaderRecompiler::RasterPrimitive::Line;
+        default: return ShaderRecompiler::RasterPrimitive::Triangle;
+    }
 }
 
 std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height) {

@@ -443,6 +443,9 @@ void ChainMinLod(const Context& context, const GuestTextureResource& descriptor,
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context) {
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    // Debug aid: APS5_VERBOSE_TEXTURE=1 restores the per-creation Texture
+    // lines (default off — they dominated the launch log at ~2.5k lines).
+    static const bool verbose = std::getenv("APS5_VERBOSE_TEXTURE") != nullptr;
     PhaseTimer timer;
     try {
         const auto colorFormat = SampledTextureFormat(context, descriptor.format);
@@ -458,9 +461,9 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         const auto& mips = geometry.mips;
         const auto arrayLayers = geometry.layers;
         const auto elementBytes = BytesPerElement(descriptor.format);
-        APS5_LOG_OUT("Texture address=0x%llx %ux%u mips=%u layers=%u dim=%d tile=%d format=%u vk=%d element=%u", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, arrayLayers,
+        APS5_LOG_OUT_IF(verbose, "Texture address=0x%llx %ux%u mips=%u layers=%u dim=%d tile=%d format=%u vk=%d element=%u", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, arrayLayers,
                      static_cast<int>(descriptor.dimension), static_cast<int>(descriptor.tileMode), descriptor.format, static_cast<int>(vkFormat), elementBytes);
-        for (const auto& mip : mips) APS5_LOG_OUT("  mip %ux%u tiled=0x%llx+0x%llx linear=0x%llx+0x%llx blocksPerRow=%u pitch=%u tail=%d", mip.width, mip.height, static_cast<unsigned long long>(mip.tiledOffset), static_cast<unsigned long long>(mip.tiledSize), static_cast<unsigned long long>(mip.linearOffset), static_cast<unsigned long long>(mip.linearSize), mip.blocksPerRow, mip.pitchBytes, mip.tail ? 1 : 0);
+        for (const auto& mip : mips) APS5_LOG_OUT_IF(verbose, "  mip %ux%u tiled=0x%llx+0x%llx linear=0x%llx+0x%llx blocksPerRow=%u pitch=%u tail=%d", mip.width, mip.height, static_cast<unsigned long long>(mip.tiledOffset), static_cast<unsigned long long>(mip.tiledSize), static_cast<unsigned long long>(mip.linearOffset), static_cast<unsigned long long>(mip.linearSize), mip.blocksPerRow, mip.pitchBytes, mip.tail ? 1 : 0);
 
         const auto guestBytes = geometry.guestBytes;
         Require(snapshot.size() == guestBytes, "texture snapshot size mismatch");
@@ -900,7 +903,9 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         Require(mipLevel < descriptor.mipCount, "storage texture mip level is outside the texture");
         const auto vkFormat = StorageFormatFor(context, ResolveTextureFormat(descriptor.format));
         storageFormat = vkFormat;
-        APS5_LOG_OUT("StorageTexture address=0x%llx %ux%u mips=%u mip=%u layers=%u base=%u dim=%d tile=%d format=%u vk=%d", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, mipLevel,
+        // Same APS5_VERBOSE_TEXTURE gate as the sampled-texture creation lines.
+        static const bool verbose = std::getenv("APS5_VERBOSE_TEXTURE") != nullptr;
+        APS5_LOG_OUT_IF(verbose, "StorageTexture address=0x%llx %ux%u mips=%u mip=%u layers=%u base=%u dim=%d tile=%d format=%u vk=%d", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, mipLevel,
                      descriptor.depthOrLastArray, descriptor.baseArray, static_cast<int>(descriptor.dimension), static_cast<int>(descriptor.tileMode), descriptor.format, static_cast<int>(vkFormat));
         geometry = DescribeSurface(descriptor);
         mips = geometry.mips;
@@ -3228,20 +3233,30 @@ StorageTexture::FillCoverage StorageTexture::ClassifyFill(std::uint64_t address,
                 if (texture->descriptor.baseAddress >= address && texture->descriptor.baseAddress + texture->guestBytes <= end) ++coverage.inside;
             }
         }
-    } else if (overlapping.empty()) {
+    }
+    // A surface's DCC keys, even over the memory of other images: transient memory aliases a dead
+    // surface's bytes with live keys (GTA V's 640x360 bloom target keeps its keys inside a 4K
+    // target's range and clears them by a fill every frame; taken for a store into the 4K image,
+    // the bloom never learned of the clear and drew each frame over the last).
+    // APS5_NO_ALIASED_KEYS_FILL=1: keys only where no image overlaps, as before.
+    static const bool aliasedKeys = std::getenv("APS5_NO_ALIASED_KEYS_FILL") == nullptr;
+    if (covered == nullptr && (overlapping.empty() || aliasedKeys)) {
         constexpr std::uint64_t keyBytes = 256;
         for (const auto* texture : live.textures) {
             if (!texture->released && texture->descriptor.dccAddress == address && texture->guestBytes / keyBytes != 0 && bytes >= texture->guestBytes / keyBytes) coverage.cover = FillCover::Keys;
         }
-    } else if (overlapping.size() > 1) {
-        coverage.cover = FillCover::Several;
-    } else {
-        auto* single = overlapping.front();
-        const auto begin = single->descriptor.baseAddress;
-        const auto stop = begin + single->guestBytes;
-        if (address >= begin && end <= stop) coverage.cover = FillCover::Inside;
-        else if (address <= begin && end >= stop) coverage.cover = FillCover::Around;
-        else coverage.cover = FillCover::Straddle;
+    }
+    if (covered == nullptr && !overlapping.empty() && coverage.cover != FillCover::Keys) {
+        if (overlapping.size() > 1) {
+            coverage.cover = FillCover::Several;
+        } else {
+            auto* single = overlapping.front();
+            const auto begin = single->descriptor.baseAddress;
+            const auto stop = begin + single->guestBytes;
+            if (address >= begin && end <= stop) coverage.cover = FillCover::Inside;
+            else if (address <= begin && end >= stop) coverage.cover = FillCover::Around;
+            else coverage.cover = FillCover::Straddle;
+        }
     }
     // Debug aid: APS5_TRACE_FILL_COVER=1 prints the first fills that meet images without covering
     // one of them (or a layer of one), with the images' surfaces, so a wider conversion can be

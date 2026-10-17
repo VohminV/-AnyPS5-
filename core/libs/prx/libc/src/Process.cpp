@@ -52,6 +52,8 @@ extern "C" void LibcRequestShutdown_nid_postfix() {
 }
 
 extern "C" void LibcRequestExit_nid_postfix(int code) {
+    std::fprintf(stderr, "[libc] LibcRequestExit(%d)\n", code);
+    std::fflush(stderr);
     if (exitRequested.exchange(true)) return;
     LibcRequestShutdown_nid_postfix();
     std::thread([code] { LibcExit_nid_no_patch(code); }).detach();

@@ -71,8 +71,8 @@ static_assert(sizeof(DescriptorBinding) == 488, "DescriptorBinding changed: upda
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: update the parameter encoder");
-static_assert(sizeof(CompiledShaderInfo) == 336, "CompiledShaderInfo changed: update the info encoder");
-static_assert(sizeof(ShaderInfo) == 224, "ShaderInfo changed: update the info encoder");
+static_assert(sizeof(CompiledShaderInfo) == 344, "CompiledShaderInfo changed: update the info encoder");
+static_assert(sizeof(ShaderInfo) == 232, "ShaderInfo changed: update the info encoder");
 static_assert(sizeof(BufferResource) == 32, "BufferResource changed: update the info encoder");
 static_assert(sizeof(ImageResource) == 112, "ImageResource changed: update the info encoder");
 static_assert(sizeof(SamplerResource) == 16, "SamplerResource changed: update the info encoder");
@@ -521,6 +521,8 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
     writer.Value(info.usesDma);
     writer.Value(info.bdaWrites);
     writer.Value(info.dispatchThreadLimit);
+    writer.Value(info.rasterPrimitive);
+    writer.Value(info.layerExported);
     encodeLayout(writer, compiled.bindings);
 }
 
@@ -623,6 +625,8 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
     reader.Value(info.usesDma);
     reader.Value(info.bdaWrites);
     reader.Value(info.dispatchThreadLimit);
+    reader.Value(info.rasterPrimitive);
+    reader.Value(info.layerExported);
     decodeLayout(reader, compiled.bindings);
 }
 

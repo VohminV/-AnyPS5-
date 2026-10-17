@@ -36,6 +36,8 @@ enum class StageInputKind {
     DispatchThreadLimit,
     Parameter,
     HelperInvocation,
+    RasterPrimitive,
+    LayerExported,
 };
 
 enum class StageOutputKind {

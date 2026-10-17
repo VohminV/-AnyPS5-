@@ -1,4 +1,5 @@
 #include <bit>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
@@ -490,6 +491,10 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
         PadInput padInput;
         MouseInput mouseInput;
         KeyboardInput keyboardInput;
+        // Diagnostic ring: the events that arrived just before SDL_QUIT, to tell a
+        // WM window-close (SDL_WINDOWEVENT_CLOSE first) from an internal QUIT.
+        std::array<std::pair<Uint32, Uint8>, 8> recentEvents {};
+        std::size_t recentCount = 0;
         while (!token.stop_requested()) {
             {
                 std::unique_lock lock(flipQueue->mutex);
@@ -504,7 +509,18 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
 
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
+                recentEvents[recentCount++ % recentEvents.size()] = {event.type, event.type == SDL_WINDOWEVENT ? static_cast<Uint8>(event.window.event) : Uint8{0}};
                 if (event.type == SDL_QUIT) {
+                    const std::size_t size = recentEvents.size();
+                    const std::size_t count = recentCount < size ? recentCount : size;
+                    const std::size_t oldest = recentCount < size ? std::size_t{0} : recentCount % size;
+                    std::fprintf(stderr, "[videoout] SDL_QUIT received; recent events:");
+                    for (std::size_t index = 0; index < count; ++index) {
+                        const auto& entry = recentEvents[(oldest + index) % size];
+                        std::fprintf(stderr, " type=0x%x sub=%u", entry.first, entry.second);
+                    }
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
                     LibcRequestExit_nid_postfix(0);
                     throw ProcessShutdown{};
                 }

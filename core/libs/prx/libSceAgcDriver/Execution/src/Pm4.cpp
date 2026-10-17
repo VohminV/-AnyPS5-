@@ -1,8 +1,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <thread>
 #include <chrono>
 #include <cstdio>
@@ -601,6 +603,15 @@ std::optional<MemoryCopy> DecodeMemoryCopy(std::span<const std::uint32_t> packet
     return MemoryCopy{source, destination, bytes};
 }
 
+void NoteDmaImmediateFill(std::span<const std::uint32_t> packet) {
+    static const bool disabled = std::getenv("APS5_NO_DMA_KEYS_FILL") != nullptr;
+    if (disabled || packet.size() < 7 || ((packet[0] >> 8u) & 0xffu) != 0x50 || dmaSource(packet) != 2 || dmaDestination(packet) == DmaSelectGds) return;
+    const std::size_t bytes = packet[6] & 0x3ffffffu;
+    const std::uint32_t pattern = packet[2];
+    if (bytes == 0 || (pattern & 0xffu) * 0x01010101u != pattern) return;
+    Graphics::StorageTexture::NoteKeysFill(address(packet[4], packet[5]), bytes, static_cast<std::uint8_t>(pattern));
+}
+
 bool UsesGpuCacheBarrier(std::span<const std::uint32_t> packet) {
     require(!packet.empty() && ((packet[0] >> 8u) & 0xffu) == 0x58, "cache barrier requires ACQUIRE_MEM");
     Validate(packet, 0);
@@ -900,6 +911,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             auto data = dmaSourceBytes(packet);
             const auto destination = dmaDestination(packet) == DmaSelectGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
             GuestMemory::CheckRange(reinterpret_cast<void*>(destination), bytes, 1, true);
+            NoteDmaImmediateFill(packet);
             GuestMemory::Write(destination, data);
             return;
         }

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
+#include <ranges>
 #include "CacheKey.hpp"
 #include "CompiledVariant.hpp"
 #include "VertexInputSpecialization.hpp"
@@ -242,6 +243,19 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
 
     constexpr MaskedSelectEliminator maskedSelectEliminator;
     if (maskedSelectEliminator.Eliminate(program).removedSelects != 0u) {
+        const bool liveAncillary = std::ranges::any_of(program.Blocks(), [](const auto& block) {
+            return std::ranges::any_of(block->Instructions(), [](const IrValue* value) {
+                return value->Opcode() == IrOpcode::GetBuiltin && value->HasUses() && value->Argument(0)->Resolve()->ImmediateU32() == static_cast<std::uint32_t>(StageInputKind::PackedAncillary);
+            });
+        });
+        if (liveAncillary) {
+            constantFolder.Fold(program);
+            ResolveControlFlowIdentities(program);
+            deadCodeEliminator.RemoveIdentities(program);
+        }
+        deadCodeEliminator.Eliminate(program);
+    }
+    if (constantFolder.ComposePackedAncillary(program)) {
         deadCodeEliminator.Eliminate(program);
     }
 
@@ -705,6 +719,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     auto& moduleKey = HostThreadLocal<std::vector<std::uint32_t>, LocalModuleKeyStorage>();
     moduleKey.clear();
     if (variant.bindings.layout.UsesPushData()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u);
+    if (request.context.pixel) {
+        if (variant.info.info.rasterPrimitive) moduleKey.push_back(static_cast<std::uint32_t>(request.context.pixel->rasterPrimitive));
+        if (variant.info.info.layerExported) moduleKey.push_back(request.context.pixel->layerExported ? 1u : 0u);
+    }
     result.vertexAttributes.reserve(result.vertexInputs.size());
     std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> vertexClasses{};
     for (const auto& input : result.vertexInputs) {
@@ -734,7 +752,8 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             moduleKey.push_back(selectors);
         }
     }
-    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty()) {
+    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() ||
+        (request.context.pixel && (variant.info.info.rasterPrimitive || variant.info.info.layerExported))) {
         {
             std::shared_lock lock(plan->mutex);
             if (const auto found = plan->modules.find(moduleKey); found != plan->modules.end()) entry = found->second;
@@ -748,6 +767,10 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             auto constants = plan->bindings.specialization;
             std::size_t index = 0;
             if (variant.bindings.layout.UsesPushData()) constants.push_back({PipelineSpecialization::PushDataOffset, moduleKey[index++]});
+            if (request.context.pixel) {
+                if (variant.info.info.rasterPrimitive) constants.push_back({PipelineSpecialization::RasterPrimitive, moduleKey[index++]});
+                if (variant.info.info.layerExported) constants.push_back({PipelineSpecialization::LayerExported, moduleKey[index++]});
+            }
             if (!artifact.vertexInputPatches.empty()) {
                 for (const auto& input : result.vertexInputs) {
                     const auto selectors = moduleKey[index++];
@@ -922,6 +945,8 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     mix(request.layout.pushConstantOffsetBytes);
     if (request.context.pixel) {
         for (const auto mapping : request.context.pixel->targetExportMapping) mix(mapping);
+        mix(static_cast<std::uint64_t>(request.context.pixel->rasterPrimitive));
+        mix(request.context.pixel->layerExported);
     }
     if (request.context.vertex) {
         const auto& vertex = *request.context.vertex;

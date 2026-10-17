@@ -87,6 +87,7 @@ struct State {
     bool hasColorTarget;
     bool rectList = false;
     VkExtent2D renderExtent;
+    std::uint32_t layerExports = 0;
     VkPrimitiveTopology topology;
     bool primitiveRestart = false;
     VkViewport viewport;
@@ -103,6 +104,7 @@ struct State {
 ShaderStages DecodeShaderStages(const QueueState& queue);
 State DecodeState(const QueueState& queue);
 std::array<std::uint8_t, 8> ExportMappings(const State& state);
+ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state);
 ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot);
 std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height);
 std::uint32_t ColorWriteMask(const Registers& context);
