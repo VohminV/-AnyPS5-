@@ -28,11 +28,8 @@ static std::vector<std::uint32_t> OptimizeSpirv(std::span<const std::uint32_t> s
     }
     std::string cmd = "re-spirv -O --eliminate-dead-code-aggressive " + inPath.string() + " -o " + outPath.string() + " 2>/dev/null";
     if (std::system(cmd.c_str()) != 0) {
-        cmd = "spirv-opt -O --eliminate-dead-code-aggressive -o " + outPath.string() + " " + inPath.string() + " 2>/dev/null";
-        if (std::system(cmd.c_str()) != 0) {
-            std::filesystem::remove(inPath, error);
-            return {spv.begin(), spv.end()};
-        }
+        std::filesystem::remove(inPath, error);
+        return {spv.begin(), spv.end()};
     }
     std::vector<std::uint32_t> result;
     std::ifstream file(outPath, std::ios::binary | std::ios::ate);
