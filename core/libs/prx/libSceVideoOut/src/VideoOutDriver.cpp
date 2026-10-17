@@ -521,8 +521,11 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
                     }
                     std::fprintf(stderr, "\n");
                     std::fflush(stderr);
-                    LibcRequestExit_nid_postfix(0);
-                    throw ProcessShutdown{};
+                    const bool ignoreQuit = std::getenv("APS5_IGNORE_SDL_QUIT") != nullptr;
+                    if (!ignoreQuit) {
+                        LibcRequestExit_nid_postfix(0);
+                        throw ProcessShutdown{};
+                    }
                 }
                 padInput.HandleEvent(event, window);
                 if (window.Handle() != nullptr) {

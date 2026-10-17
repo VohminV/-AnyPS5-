@@ -904,6 +904,9 @@ RecompileResult RecompileImpl(const RecompileRequest& request) {
     materializer.Materialize(*source->plan, runtime, snapshot);
     if (!request.useCache) {
         if (aotVariant.has_value()) {
+            aotVariant->layout = request.layout;
+            aotVariant->bindings.pushConstantOffsetBytes = request.layout.pushConstantOffsetBytes;
+            aotVariant->bindings.pushConstantSizeBytes = request.layout.pushConstantSizeBytes;
             auto result = materializeResult(*aotVariant, request, snapshot);
             result.cacheHit = true;
             return result;
@@ -915,6 +918,9 @@ RecompileResult RecompileImpl(const RecompileRequest& request) {
         return result;
     }
     if (aotVariant.has_value()) {
+        aotVariant->layout = request.layout;
+        aotVariant->bindings.pushConstantOffsetBytes = request.layout.pushConstantOffsetBytes;
+        aotVariant->bindings.pushConstantSizeBytes = request.layout.pushConstantSizeBytes;
         auto result = materializeResult(*aotVariant, request, snapshot);
         result.cacheHit = true;
         return result;
