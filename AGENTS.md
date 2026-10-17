@@ -86,7 +86,7 @@ When implementing new features or fixes:
 - **AOT Shader Cache** (`core/shader/recompiler/AotCache.{hpp,cpp}`): ключ = hash(raw RDNA2 бинарник + static pipeline layout), файлы `aot_shader_cache/<hash>.avc`, сжатие через `re-spirv -O --eliminate-dead-code-aggressive` (без spirv-opt фолбэка), kill switch `APS5_NO_AOT_CACHE=1`. При hit SPIR-V эмиссия пропускается.
 - **Indirect-call fast fallback**: `APS5_ALLOW_INDIRECT_CALLS=1` позволяет шейдерам с неразрешимыми `s_swappc_b64` компилироваться вместо `deferred` (`GraphBuilder.cpp`, `InstructionTranslator.cpp`).
 - **Structurizer guard**: bounds check на `successor` block id в `rebuildPredecessors` (источник SIGSEGV на больших графах, 819+ блоков).
-- Окно игры закрывается пользователем (SDL_QUIT: MOUSEMOTION→LEAVE→CLOSE→QUIT), не самой игрой. Игра штормит ~2600 шейдеров после интро видео; до сцены не доходит без длинного тайм-аута и без закрытия окна.
+- Окно игры закрывается пользователем (SDL_QUIT: MOUSEMOTION→LEAVE→CLOSE→QUIT), не самой игрой. Игра штормит ~2600 шейдеров после интро видео; до сцены не доходит без длинного тайм-аута и без закрытия окна. `APS5_IGNORE_SDL_QUIT=1` игнорирует внешний SDL_QUIT (оконный менеджер/система), позволяя игре продолжать компиляцию шейдеров.
 - Запуск: `app.elf` déjà exécutable, лежит рядом с `libs/` и `app0/` (раунтайм-レイаут `app.elf + libs/ + app0/` per USAGE.md). Прямой запуск: `cd PPSA04263 && ./app.elf`. Через run_game.py: `--game-dir app0 --output app.elf --run --run-timeout 3600` (не закрывать окно после интро).
 - Сборка: `ninja -C build core/libs/libs/libSceAgcDriver.prx`, копировать в `PPSA04263/libs/`, verificar file count (117).
 - ctest: ровно 13 предсуществующих падений (список в рабочих заметках), новых нет.

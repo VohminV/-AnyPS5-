@@ -50,3 +50,4 @@ and temp dirs only — no game dumps, keys, or sensitive data.
 | `APS5_NO_SHADER_CACHE=1` | Disable the on-disk `ShaderDiskCache` (`shader_cache/`). |
 | `APS5_NO_FAILURE_MEMO=1` | Rebuild shaders that previously failed planning/emission instead of caching the failure. |
 | `APS5_NO_RESULT_MEMO=1` | Every `Recompile(request, capture)` materializes its own result instead of memoizing. |
+| `APS5_IGNORE_SDL_QUIT=1` | Ignore external SDL_QUIT events (window manager/system close) so the game keeps compiling shaders instead of exiting. |
