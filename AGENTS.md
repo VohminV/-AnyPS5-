@@ -80,19 +80,20 @@ When implementing new features or fixes:
 6. Document any new environment variables or configuration options
 
 ### Current Task Context
-- Fixing TLSF allocator crash (UUM-83271) during scene transitions in PS5 emulator
-- Crash: Unity's TLSF `app.exe+0x1a579ec` reads `0xffffffffffffffff` on `UnityGfxDeviceWorker` (free-list corrupted)
-- Analysis: OS-level owner guard cannot see in-game TLSF free/realloc inside the same mapped arena; gen==0 (untracked) write-watch stamps stay silent on free-list pop (reads before writes), so stale GPU results were stored over the new owner's live bytes
-- Fix: `streamingTextureMutex` is now `recursive_mutex`, held ONLY for the gen==0 fast-path check (never across FlushPending/GPU waits), skipped when GpuMutex is held (avoids streaming->Gpu vs Gpu->streaming inversion); plus TLSF-reuse guard in `writeBackLayers`: for gen==0 compare guest vs `original` snapshot before storing, drop on mismatch
-- Kill switch: `APS5_NO_REFRESH_FAST_PATH=1` disables fast path AND streaming mutex (reuse guard also gated by `unregisteredDrop`)
-- Ship patched libs: no built `.prx` binaries are stored in this repo
-  (copyright caution — libs are build artifacts only). Rebuild with the
-  `libs` target (NID patcher); the upstream source is
-  `build/core/libs/libs/*.prx` (NOT `unpatched/`). After any relink/rebuild,
-  copy the game's `libs/` from there and verify the file count — a
-  missing/short `libs/` causes Windows LoadLibrary error 126 at launch.
-  MinGW-built libs additionally need `libstdc++-6.dll` reachable
-  (beside `app.exe` or on PATH).
+- GTA V (PPSA04263) port: black screen after splash, shader storm at intro video.
+- **Этап 1 (ComposePackedAncillary) завершен**: `rectangle ABI` краш устранен, 0 «unsupported live use», 0 «rectangle ABI» в игре. Порт `ComposePackedAncillary()` из `boykopovar/AnyPS5` (discussion #1203) с восстановленным `Fail` в `ShaderInfoCollector`, spec-id 8233/8234, сериализатор v14, диск-кэш v22, тест `PixelAncillary.cpp` зелёный.
+- **Этап 2 (ResourceTracker::GetHandle)**: удален ранний `ReadConstBuffer`-fail, валидация уходит в `ValidateSource`/`SrtWalker` (поддерживает `GetSrtResource → ReadConst → GetBufferResource → ReadConstBuffer` цепочки RAGE). Тест `ResourceTracker` пройден.
+- **AOT Shader Cache** (`core/shader/recompiler/AotCache.{hpp,cpp}`): ключ = hash(raw RDNA2 бинарник + static pipeline layout), файлы `aot_shader_cache/<hash>.avc`, сжатие через `re-spirv -O --eliminate-dead-code-aggressive` (без spirv-opt фолбэка), kill switch `APS5_NO_AOT_CACHE=1`. При hit SPIR-V эмиссия пропускается.
+- **Indirect-call fast fallback**: `APS5_ALLOW_INDIRECT_CALLS=1` позволяет шейдерам с неразрешимыми `s_swappc_b64` компилироваться вместо `deferred` (`GraphBuilder.cpp`, `InstructionTranslator.cpp`).
+- **Structurizer guard**: bounds check на `successor` block id в `rebuildPredecessors` (источник SIGSEGV на больших графах, 819+ блоков).
+- Окно игры закрывается пользователем (SDL_QUIT: MOUSEMOTION→LEAVE→CLOSE→QUIT), не самой игрой. Игра штормит ~2600 шейдеров после интро видео; до сцены не доходит без длинного тайм-аута и без закрытия окна.
+- Запуск: `app.elf` déjà exécutable, лежит рядом с `libs/` и `app0/` (раунтайм-レイаут `app.elf + libs/ + app0/` per USAGE.md). Прямой запуск: `cd PPSA04263 && ./app.elf`. Через run_game.py: `--game-dir app0 --output app.elf --run --run-timeout 3600` (не закрывать окно после интро).
+- Сборка: `ninja -C build core/libs/libs/libSceAgcDriver.prx`, копировать в `PPSA04263/libs/`, verificar file count (117).
+- ctest: ровно 13 предсуществующих падений (список в рабочих заметках), новых нет.
+- Рабочий каталог: `/home/vita/Документы/-AnyPS5-/`; игра: `/home/vita/Документы/PPSA04263/`.
+- Только `python3`; git-команды запрещены AGENTS.md (пользователь делает commit/push вручную, здесь — по прямой просьбе пользователя).
+- Upstream tarball: `/tmp/opencode/upstream/AnyPS5-main/` (эталон порта).
+- Логи: `/home/vita/Документы/-AnyPS5-/logs/run_<stamp>.log`.
 
 ### Build Commands
 ```bash

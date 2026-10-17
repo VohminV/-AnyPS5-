@@ -38,3 +38,15 @@ vulkan ─────┘
 `tools/tests/test_{inspect_executable,preflight,capabilities,plan,vulkan_check}.py`
 run under `unittest` and `ctest` (root `CMakeLists.txt`). Synthetic headers
 and temp dirs only — no game dumps, keys, or sensitive data.
+
+## Shader recompiler environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `APS5_NO_AOT_CACHE=1` | Disable the Runtime AOT shader cache (`core/shader/recompiler/AotCache.{hpp,cpp}`); every shader recompiles through the full decode → structurize → translate → SPIR-V pipeline. |
+| `APS5_ALLOW_INDIRECT_CALLS=1` | Allow shaders with unresolvable `s_swappc_b64` register-indirect calls to compile instead of going to `deferred` (`GraphBuilder.cpp`, `InstructionTranslator.cpp`). |
+| `APS5_TRACE_EXIT=1` | Trace `exit()`/`_Exit()` calls in the guest libc (helps diagnose why a run ends). |
+| `APS5_VERBOSE_TEXTURE=1` | Enable per-resource texture logging in `Texture.cpp` (disabled by default to avoid log spam). |
+| `APS5_NO_SHADER_CACHE=1` | Disable the on-disk `ShaderDiskCache` (`shader_cache/`). |
+| `APS5_NO_FAILURE_MEMO=1` | Rebuild shaders that previously failed planning/emission instead of caching the failure. |
+| `APS5_NO_RESULT_MEMO=1` | Every `Recompile(request, capture)` materializes its own result instead of memoizing. |

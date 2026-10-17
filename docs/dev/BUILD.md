@@ -77,3 +77,14 @@ Set `APS5_PIPELINE_STATS=1` to capture and print driver statistics for each newl
 ## Shader recompiler
 
 The shader recompilation logic in [core/shader/recompiler](../../core/shader/recompiler) is isolated from the rest of the project and is a pure function of its input data, designed for integration into any other project. The current CMake target also includes cache support and links a supplied runtime target, glslang, and optionally SPIRV-Tools.
+
+### Runtime AOT shader cache
+
+The AOT cache (`core/shader/recompiler/AotCache.{hpp,cpp}`) compresses compiled SPIR-V with `re-spirv -O --eliminate-dead-code-aggressive` before writing to `aot_shader_cache/`. `re-spirv` is invoked as an external CLI tool; if it is not found, the unoptimized SPIR-V is stored instead. Kill switch: `APS5_NO_AOT_CACHE=1`. No `spirv-opt` fallback is used.
+
+### Environment variables affecting the build / runtime
+
+| Variable | Effect |
+|----------|--------|
+| `APS5_NO_AOT_CACHE=1` | Disable the Runtime AOT shader cache. |
+| `APS5_ALLOW_INDIRECT_CALLS=1` | Allow shaders with unresolvable `s_swappc_b64` register-indirect calls to compile instead of going to `deferred`. |

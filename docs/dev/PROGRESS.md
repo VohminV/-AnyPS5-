@@ -16,6 +16,15 @@ Comparisons identify functions by library and name. When a head group becomes a 
 
 Real removals and transitions back to stubs remain visible. Percentages retain the original snapshot totals, so eliminating duplicate accounting can change a percentage without changing available functionality. Older JSON snapshots without `shared_sources` are accepted.
 
+## GTA V (PPSA04263) port status
+
+- **Stage 1 (ComposePackedAncillary)**: completed. `rectangle ABI` crash fixed, 0 «unsupported live use», 0 «rectangle ABI» in game. Port of `ComposePackedAncillary()` from `boykopovar/AnyPS5` (discussion #1203) with restored `Fail` in `ShaderInfoCollector`, spec-id 8233/8234, serializer v14, disk cache v22, `PixelAncillary.cpp` test green.
+- **Stage 2 (ResourceTracker::GetHandle)**: completed. Early `ReadConstBuffer` fail removed; validation moved to `ValidateSource`/`SrtWalker` supporting `GetSrtResource → ReadConst → GetBufferResource → ReadConstBuffer` RAGE chains.
+- **AOT Shader Cache**: `core/shader/recompiler/AotCache.{hpp,cpp}` — key = hash(raw RDNA2 binary + static pipeline layout), files `aot_shader_cache/<hash>.avc`, compression via `re-spirv -O --eliminate-dead-code-aggressive`, kill switch `APS5_NO_AOT_CACHE=1`.
+- **Indirect-call fast fallback**: `APS5_ALLOW_INDIRECT_CALLS=1` allows shaders with unresolvable `s_swappc_b64` to compile instead of `deferred`.
+- **Structurizer guard**: bounds check on `successor` block id in `rebuildPredecessors` (SIGSEGV source on large graphs, 819+ blocks).
+- **Known blocker**: game exits via user `SDL_QUIT` (MOUSEMOTION→LEAVE→CLOSE→QUIT) after ~4–12 min of shader storm (~2600 shaders) post-intro video; does not reach in-game scene without a long timeout and without closing the window.
+
 ## Verification
 
 ```sh

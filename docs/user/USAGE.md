@@ -95,6 +95,36 @@ Windows PowerShell:
 .\app.exe
 ```
 
+### Runtime AOT shader cache
+
+The shader recompiler (`core/shader/recompiler/`) keeps a Runtime AOT cache so
+that a shader compiled once is reused on later launches without recompilation:
+
+- Directory: `ANYPS5_AOT_CACHE_DIR` or `<cwd>/aot_shader_cache/`
+- Kill switch: `APS5_NO_AOT_CACHE=1`
+- Compression: `re-spirv -O --eliminate-dead-code-aggressive` (spirv-opt is not used)
+
+On the first run each shader is compiled and stored as
+`aot_shader_cache/<hash>.avc`. On later runs the SPIR-V is loaded directly,
+skipping the heavy RDNA2 decoder + structurize + translate pipeline. Expect
+15–30 min of shader compilation on a cold cache for shader-heavy titles such as
+GTA V, and 3–10 min on a warm cache.
+
+### GTA V (PPSA04263)
+
+The game layout is `app.elf + libs/ + app0/`. Launch directly from the game
+directory (the emulator resolves `app0/` relative to `current_path()`):
+
+```sh
+cd PPSA04263
+./app.elf
+```
+
+Do not close the window immediately after the intro video: the title compiles
+~2600 shaders during the loading storm before the first in-game scene appears.
+Use `--run-timeout 3600` (or more) when launching through `tools/run_game.py`.
+
+
 ### System fonts
 
 Games that open the console's system font sets (`sceFontOpenFontSet`) need font files in an `anyps5-fonts/` directory beside the output executable; set `ANYPS5_SYSTEM_FONTS` to use another directory. Files dumped from the console are used under their own names (`SST-Roman.otf`, `SST-Bold.otf`, `SSTJpPro-Regular.otf`, ...). Without them, these openly licensed substitutes are used when present: `NotoSans-{Light,Regular,Medium,Bold}.ttf` and `NotoSans-{LightItalic,Italic,MediumItalic,BoldItalic}.ttf` (Latin and Vietnamese), `NotoSansMono-{Light,Regular,Medium,Bold}.ttf` (typewriter), `NotoSansThai-{Light,Regular,Medium,Bold}.ttf` (Thai) and `NotoSansCJK-{Light,Regular,Medium,Bold}.ttc` (Japanese and Chinese). Without either, opening a system font set fails and the game shows no text in those fonts.
