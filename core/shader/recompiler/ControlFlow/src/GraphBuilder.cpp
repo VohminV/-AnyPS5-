@@ -541,6 +541,13 @@ std::vector<SwappcCall> analyzeSwappcCalls(const RdnaProgram& program, const Swa
             detail += swappc == nullptr ? ", no swappc info" : (std::string(", fetchAllowed=") + (swappc->fetchCallAllowed ? "1" : "0") + " userBase=" + std::to_string(swappc->userDataBaseRegister) + " userCount=" + std::to_string(swappc->userDataCount));
             detail += std::string(", positional=") + (positional ? "1" : "0") + ", userDataPair=" + (userDataPair ? "1" : "0") + ", outsideProgram=" + (outsideProgram ? "1" : "0");
             detail += ", reason=no s_getpc+s_add/s_sub pattern in the 1..3-instruction window; fetch call additionally requires fetchAllowed=1, positional=1 and (userDataPair=1 or outsideProgram=1))";
+            const bool allowIndirect = std::getenv("APS5_ALLOW_INDIRECT_CALLS") != nullptr;
+            if (allowIndirect) {
+                // Fast fallback: leave unresolvable indirect s_swappc_b64 calls in place
+                // instead of aborting the whole shader; the shader will contain a gap
+                // at this call but will compile and run rather than being deferred.
+                continue;
+            }
             throw std::invalid_argument(detail);
         }
         call.targetProgramCounter = target;

@@ -11,8 +11,10 @@
 #include "SpirvBackend/SpirvSpecialization.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "ShaderDiskCache.hpp"
+#include "AotCache.hpp"
 #include <list>
 #include <map>
+#include <optional>
 #include <set>
 #include <mutex>
 #include <new>
@@ -185,7 +187,14 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
 
     clock.Enter("structurize");
     constexpr Structurizer structurizer;
+    const auto blocksBefore = cfg.blocks.size();
+    const auto structurizeStart = std::chrono::steady_clock::now();
     structurizer.Structurize(cfg);
+    const auto structurizeElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - structurizeStart).count();
+    if (blocksBefore > 500u || structurizeElapsed > 2000) {
+        std::fprintf(stderr, "[recompile] structurize heavy: blocks=%u elapsed=%ums code=0x%08x (consider APS5_NO_STRUCTURIZE_GUARD=1)\n",
+            blocksBefore, structurizeElapsed, request.shader.codeAddress);
+    }
 
     TranslateOptions translateOptions {};
     translateOptions.stage = stageKind;
@@ -828,6 +837,15 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
         }
     }
+    if (variant == nullptr && AotCache::Enabled()) {
+        if (auto loaded = AotCache::Lookup(AotCache::HashCode(request.shader.code, request.layout)); loaded.has_value()) {
+            loaded->artifact.variantId = nextVariantId();
+            variant = std::make_shared<const CompiledVariant>(std::move(*loaded));
+            std::fprintf(stderr, "[aot-cache] hit code=0x%08x words=%zu\n", request.shader.codeAddress, variant->artifact.spirv.size());
+        } else {
+            std::fprintf(stderr, "[aot-cache] miss code=0x%08x words=%zu\n", request.shader.codeAddress, request.shader.code.size());
+        }
+    }
     if (variant == nullptr) {
         auto program = source.program != nullptr ? std::move(*source.program) : PrepareResourceProgram(request);
         source.program.reset();
@@ -839,6 +857,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             throw;
         }
         if (disk) ShaderDiskCache::Store(std::move(diskKey), variant);
+        if (AotCache::Enabled()) AotCache::Store(AotCache::HashCode(request.shader.code, request.layout), *variant);
     }
     source.program.reset();
     source.variants.push_back(variant);
@@ -863,15 +882,43 @@ RecompileResult RecompileImpl(const RecompileRequest& request) {
     const auto runtime = memory.MakeRuntime(request.context.userData, request.shader.codeAddress);
     ResourceSnapshot snapshot;
     constexpr ResourceMaterializer materializer;
-    if (!request.useCache) {
-        auto program = PrepareResourceProgram(request);
-        const auto plan = materializer.ExtractPlan(program);
-        materializer.Materialize(plan, runtime, snapshot);
-        const auto variant = compileVariant(request, std::move(program));
-        return materializeResult(variant, request, snapshot);
+
+    // AOT fast path: key on the raw shader binary hash + static layout. On a hit
+    // SPIR-V emission (compileVariant, i.e. the heavy RDNA2 decoder + structurize
+    // + translate into SPIR-V) is skipped and the compiled variant is restored
+    // from disk. The IR plan is still built once per shader (getSource) to
+    // materialize the per-dispatch descriptor snapshot; it is memoized in-process
+    // so repeated dispatches of the same shader are cheap.
+    const std::uint64_t aotHash = AotCache::HashCode(request.shader.code, request.layout);
+    std::optional<CompiledVariant> aotVariant;
+    if (AotCache::Enabled()) {
+        if (auto loaded = AotCache::Lookup(aotHash); loaded.has_value()) {
+            std::fprintf(stderr, "[aot-cache] hit code=0x%08x words=%zu\n", request.shader.codeAddress, loaded->artifact.spirv.size());
+            aotVariant = std::move(*loaded);
+        } else {
+            std::fprintf(stderr, "[aot-cache] miss code=0x%08x words=%zu\n", request.shader.codeAddress, request.shader.code.size());
+        }
     }
+
     const auto source = getSource(request);
     materializer.Materialize(*source->plan, runtime, snapshot);
+    if (!request.useCache) {
+        if (aotVariant.has_value()) {
+            auto result = materializeResult(*aotVariant, request, snapshot);
+            result.cacheHit = true;
+            return result;
+        }
+        auto program = PrepareResourceProgram(request);
+        const auto variant = compileVariant(request, std::move(program));
+        auto result = materializeResult(variant, request, snapshot);
+        if (AotCache::Enabled()) AotCache::Store(AotCache::HashCode(request.shader.code, request.layout), variant);
+        return result;
+    }
+    if (aotVariant.has_value()) {
+        auto result = materializeResult(*aotVariant, request, snapshot);
+        result.cacheHit = true;
+        return result;
+    }
     return materializeVariant(*source, request, snapshot);
 }
 

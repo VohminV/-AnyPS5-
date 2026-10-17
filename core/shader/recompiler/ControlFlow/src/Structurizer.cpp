@@ -91,6 +91,9 @@ void rebuildPredecessors(ControlFlowGraph& graph) {
     }
     for (const auto& block : graph.blocks) {
         for (const auto successor : block.successors) {
+            if (successor >= graph.blocks.size()) {
+                throw std::invalid_argument("control flow graph has successor block id " + std::to_string(successor) + " out of range (blocks=" + std::to_string(graph.blocks.size()) + ")");
+            }
             addUnique(graph.blocks[successor].predecessors, block.id);
         }
     }
