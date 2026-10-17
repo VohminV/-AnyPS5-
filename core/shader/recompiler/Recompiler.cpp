@@ -839,6 +839,9 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     }
     if (variant == nullptr && AotCache::Enabled()) {
         if (auto loaded = AotCache::Lookup(AotCache::HashCode(request.shader.code, request.layout)); loaded.has_value()) {
+            loaded->layout = request.layout;
+            loaded->bindings.pushConstantOffsetBytes = request.layout.pushConstantOffsetBytes;
+            loaded->bindings.pushConstantSizeBytes = request.layout.pushConstantSizeBytes;
             loaded->artifact.variantId = nextVariantId();
             variant = std::make_shared<const CompiledVariant>(std::move(*loaded));
             std::fprintf(stderr, "[aot-cache] hit code=0x%08x words=%zu\n", request.shader.codeAddress, variant->artifact.spirv.size());
