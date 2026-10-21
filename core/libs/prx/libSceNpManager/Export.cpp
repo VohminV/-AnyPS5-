@@ -215,4 +215,9 @@ int APS5_VABI sceNpGetUserIdByAccountId() {
     return 0;
 }
 
+int APS5_VABI sceNpGetSandboxInfo(char* sandbox_info) {
+    if (sandbox_info != nullptr) sandbox_info[0] = '\0';
+    return 0;
+}
+
 }

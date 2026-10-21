@@ -12,6 +12,14 @@ int APS5_VABI sceAudioOut2Initialize(void) {
     return 0;
 }
 
+int APS5_VABI sceAudioOut2EnableChat(void) {
+    return 0;
+}
+
+int APS5_VABI sceAudioOut2DisableChat(void) {
+    return 0;
+}
+
 int APS5_VABI sceAudioOut2Set3DLatency(int userId, std::uint32_t latency) {
     if (userId != USER_ID_SYSTEM || latency < MIN_SUPPORTED_3D_LATENCY || latency > MAX_SUPPORTED_3D_LATENCY) NotImplemented_nid_no_patch(__func__);
     return 0;
