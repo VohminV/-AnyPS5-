@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LowVramDownscale.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -433,7 +434,9 @@ void ChainMinLod(const Context& context, const GuestTextureResource& descriptor,
     const auto clamp = EffectiveMinLod(descriptor);
     if (clamp == 0.0f) return;
     Require(context.imageViewMinLod, "guest texture descriptor uses a minimum LOD clamp, which needs VK_EXT_image_view_min_lod");
-    minLod.minLod = clamp;
+    const auto& range = viewInfo.subresourceRange;
+    const auto last_level = range.baseMipLevel + range.levelCount - 1u;
+    minLod.minLod = std::min(clamp, static_cast<float>(last_level));
     minLod.pNext = viewInfo.pNext;
     viewInfo.pNext = &minLod;
 }
@@ -453,7 +456,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         Require(!depthCompare || descriptor.dimension != TextureDimension::k3D, "comparison sampling does not support 3D depth textures");
         const auto vkFormat = depthCompare ? (colorFormat == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D16_UNORM) : colorFormat;
         const VkImageAspectFlags aspect = depthCompare ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-        if (IsBlockCompressed(descriptor.format)) {
+        const bool blockCompressed = IsBlockCompressed(descriptor.format);
+        if (blockCompressed) {
             Require(context.textureCompressionBC, "device does not support BC compressed textures");
         }
 
@@ -484,17 +488,53 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image), "vkCreateImage");
-        owned = std::make_shared<OwnedImage>(context, image, VK_NULL_HANDLE);
+        // Sampled snapshot textures may be capped at FullHD (see LowVramDownscale): the upload
+        // below then copies the top-left region of every mip into the smaller image.
+        if (aspect == VK_IMAGE_ASPECT_COLOR_BIT) LowVramDownscale::Apply(imageInfo, blockCompressed ? 4u : 1u);
+        const bool can_retry_emergency = aspect == VK_IMAGE_ASPECT_COLOR_BIT;
+        bool emergency_applied = false;
+        for (;;) {
+            image = VK_NULL_HANDLE;
+            const VkResult image_result = context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image);
+            if (image_result != VK_SUCCESS) {
+                if (image_result == VK_ERROR_OUT_OF_DEVICE_MEMORY && can_retry_emergency && !emergency_applied) {
+                    VkImageCreateInfo emergency_info = imageInfo;
+                    if (LowVramDownscale::ApplyEmergency(emergency_info, blockCompressed ? 4u : 1u)) {
+                        imageInfo = emergency_info;
+                        emergency_applied = true;
+                        continue;
+                    }
+                }
+                Check(image_result, "vkCreateImage");
+            }
+            owned = std::make_shared<OwnedImage>(context, image, VK_NULL_HANDLE);
 
-        VkMemoryRequirements requirements{};
-        context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
-        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocation.allocationSize = requirements.size;
-        allocationBytes = requirements.size;
-        allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory texture");
-        Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
+            VkMemoryRequirements requirements{};
+            context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            const VkResult allocation_result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
+            if (allocation_result != VK_SUCCESS) {
+                owned.reset();
+                image = VK_NULL_HANDLE;
+                if (allocation_result == VK_ERROR_OUT_OF_DEVICE_MEMORY && can_retry_emergency && !emergency_applied) {
+                    VkImageCreateInfo emergency_info = imageInfo;
+                    if (LowVramDownscale::ApplyEmergency(emergency_info, blockCompressed ? 4u : 1u)) {
+                        imageInfo = emergency_info;
+                        emergency_applied = true;
+                        continue;
+                    }
+                }
+                Check(allocation_result, "vkAllocateMemory texture");
+            }
+
+            allocationBytes = requirements.size;
+            owned->memory = memory;
+            Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory");
+            break;
+        }
 
         {
             // Debug aid: APS5_DUMP_TEXTURE=<hex addresses, comma separated> saves the detiled first mip
@@ -570,14 +610,14 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             toTransferDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             toTransferDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             toTransferDst.image = image;
-            toTransferDst.subresourceRange = {aspect, 0, descriptor.mipCount, 0, geometry.imageLayers};
+            toTransferDst.subresourceRange = {aspect, 0, imageInfo.mipLevels, 0, geometry.imageLayers};
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearReadBarrier, 1, &toTransferDst);
 
             std::vector<VkBufferImageCopy> regions;
             regions.reserve(static_cast<std::size_t>(arrayLayers) * mips.size());
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
                 const auto linearLayerOffset = static_cast<std::uint64_t>(layer) * sliceLinearBytes;
-                for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+                for (std::uint32_t level = 0; level < descriptor.mipCount && level < imageInfo.mipLevels; ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
                     VkBufferImageCopy region{};
@@ -586,7 +626,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                     region.bufferImageHeight = 0;
                     region.imageSubresource = {aspect, level, geometry.CopyLayer(layer), 1};
                     region.imageOffset = {0, 0, geometry.CopyDepth(layer)};
-                    region.imageExtent = {std::max(descriptor.width >> level, 1u), std::max(descriptor.height >> level, 1u), 1u};
+                    // A downscaled image is a top-left crop of the guest mip, so copy only the overlap.
+                    region.imageExtent = {std::min(std::max(descriptor.width >> level, 1u), std::max(imageInfo.extent.width >> level, 1u)), std::min(std::max(descriptor.height >> level, 1u), std::max(imageInfo.extent.height >> level, 1u)), 1u};
                     regions.push_back(region);
                 }
             }
@@ -632,7 +673,11 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             }
         }
 
-        const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
+        const auto hostMipLevels = std::max(imageInfo.mipLevels, 1u);
+        const auto baseLevel = std::min(descriptor.baseLevel, hostMipLevels - 1u);
+        const auto lastLevel = std::min({descriptor.lastLevel, descriptor.mipCount - 1u, hostMipLevels - 1u});
+        Require(lastLevel >= baseLevel, "guest texture view has no mip level the downscaled image keeps");
+        const auto viewLevelCount = lastLevel - baseLevel + 1u;
         const auto viewLayerCount = geometry.imageLayers - descriptor.baseArray;
         if (descriptor.dimension == TextureDimension::kCube) {
             Require(viewLayerCount % 6u == 0, "guest cube texture view does not contain a multiple of 6 array slices");
@@ -644,7 +689,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         viewInfo.format = vkFormat;
         viewFormat = vkFormat;
         viewInfo.components = depthCompare ? VkComponentMapping{} : components;
-        viewInfo.subresourceRange = {aspect, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
+        viewInfo.subresourceRange = {aspect, baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
 

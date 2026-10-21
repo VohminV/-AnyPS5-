@@ -549,6 +549,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/DepthSurfaceReuse.cpp
         tests/UntrackedRescue.cpp
         tests/ResidentReuse.cpp
+        tests/LowVramDownscale.cpp
         Graphics/src/Draw.cpp
         Graphics/src/DepthBoundsFallback.cpp
         Graphics/src/DepthSurface.cpp

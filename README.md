@@ -46,6 +46,7 @@ This fork is based on upstream [AnyPS5](https://github.com/boykopovar/AnyPS5) pl
 - Windows game launcher (`launcher/`, ImGui + Win32 + DirectX 11): game library, covers, themes, system-wide F1 menu.
 - CPU packet-execution backend for the graphics driver (`CpuBackend/`, `ANYPS5_CPU_BACKEND=legacy|fast|auto`), CPU fallback for depth-bounds tests (`APS5_DEPTH_BOUNDS=hardware|cpu|auto`), capability-driven unified memory (`GuestUnifiedMemory`).
 - Storage-texture write-back owner guard and TLSF-reuse guard in `Graphics/src/Texture.cpp` (kill switch `APS5_NO_REFRESH_FAST_PATH=1`).
+- Low-VRAM FullHD cap for sampled texture snapshots (`Graphics/include/LowVramDownscale.hpp`, auto-enabled on device-local heaps ≤ 9 GiB, `ANYPS5_DOWNSCALE*` overrides; see [USAGE.md](docs/user/USAGE.md)).
 - Gamepad-only input (keyboard/mouse pad bindings removed) and a local tested-games table (`docs/user/COMPATIBILITY.md`).
 - Shader recompiler: Runtime AOT shader cache (`core/shader/recompiler/AotCache.{hpp,cpp}`, compressed with `re-spirv`, kill switch `APS5_NO_AOT_CACHE=1`), indirect-call fast fallback for unresolvable `s_swappc_b64` (`APS5_ALLOW_INDIRECT_CALLS=1`), structurizer bounds check on large CFGs. GTA V (PPSA04263): `ComposePackedAncillary()` port (spec-id 8233/8234, serializer v14, disk cache v22) and `ResourceTracker::GetHandle` SRT chain validation fix.
 

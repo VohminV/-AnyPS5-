@@ -110,6 +110,24 @@ skipping the heavy RDNA2 decoder + structurize + translate pipeline. Expect
 15–30 min of shader compilation on a cold cache for shader-heavy titles such as
 GTA V, and 3–10 min on a warm cache.
 
+### Low-VRAM texture downscale (FullHD)
+
+Sampled texture snapshots larger than the configured extent are created smaller
+and only the top-left region of every mip is uploaded. There is no resampling:
+this is a VRAM safety fallback for textures far larger than the display, ported
+from KytyPS5's `low_vram_downscale.h`, not a quality scaler. Render targets,
+depth surfaces and storage images keep their guest extents.
+
+It is enabled automatically when the largest device-local Vulkan heap is at most
+9 GiB (so 8 GiB cards are covered). Overrides:
+
+- `ANYPS5_DOWNSCALE=1|0|auto` — force on, force off, or auto-detect (default)
+- `ANYPS5_DOWNSCALE_MAX=1920x1080` — target extent (also accepts a single number)
+- `ANYPS5_DOWNSCALE_TEXTURES=0` — keep sampled textures at their guest size
+- `ANYPS5_DOWNSCALE_VRAM_LIMIT_MB=<MiB>` — auto-enable threshold
+- `ANYPS5_DOWNSCALE_ALIGN_EVEN=0` — allow odd extents (block-compressed formats stay block-aligned)
+- `ANYPS5_DOWNSCALE_CLAMP_MIPS=0` — keep full mip chains; textures whose chain no longer fits the smaller extent are left at guest size
+
 ### GTA V (PPSA04263)
 
 The game layout is `app.elf + libs/ + app0/`. Launch directly from the game

@@ -35,6 +35,7 @@ void RunGuestTextureResourceTests();
 void RunDepthSurfaceReuseTests();
 void RunUntrackedRescueTests();
 void RunResidentReuseTests();
+void RunLowVramDownscaleTests();
 void RunGuestSamplerResourceTests();
 void RunTextureDetilerTests(const AgcDriver::Graphics::Context& context, const TextureDetilerTestAccess& access);
 
