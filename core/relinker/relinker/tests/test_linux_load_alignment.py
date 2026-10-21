@@ -48,6 +48,7 @@ def main():
         result = subprocess.run([str(relinker), "--skip-sce-module", str(source), str(output)], capture_output=True, text=True, timeout=20)
         if result.returncode != 0:
             raise AssertionError((result.returncode, result.stdout, result.stderr))
+        assert output.stat().st_mode & 0o111, "Linux output must be executable"
         segments = loads(output.read_bytes())
         first = segments[0]
         alignment = max(segment[7] for segment in segments)

@@ -130,6 +130,12 @@ int main(const int argc, char* argv[]) {
             std::cout << "Guest module: " << artifact.Path.string() << '\n';
         }
         fileWriter.Write(absPath, executableBytes);
+        if (!args.toWindows) {
+            std::error_code error;
+            std::filesystem::permissions(absPath,
+                std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec | std::filesystem::perms::others_exec,
+                std::filesystem::perm_options::add, error);
+        }
         std::cout << "External prx references: " << result.RegistryEntries.size() << "\nOutput file: " << absPath << '\n';
         std::cout << "Expected runtime layout (relative to the output executable):\n"
                   << std::filesystem::path(absPath).filename().string() << "\n"

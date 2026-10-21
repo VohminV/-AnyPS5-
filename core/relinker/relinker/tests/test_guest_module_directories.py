@@ -23,6 +23,29 @@ def module_with_symbol(exported):
     return image
 
 
+def qualified_consumer(library, dependencies):
+    image = module_with_symbol(False)
+    strings = b"\0shared#A#B\0"
+    offsets = {}
+    for dependency in dependencies:
+        offsets[dependency] = len(strings)
+        strings += dependency.encode() + b"\0"
+    image[0x800:0x800 + len(strings)] = strings
+    tags = []
+    for index in range(64):
+        tag, value = struct.unpack_from("<qQ", image, 0x600 + index * 16)
+        if tag == 0:
+            break
+        tags.append((tag, len(strings) if tag == 10 else value))
+    tags.extend((1, offsets[dependency]) for dependency in dependencies)
+    tags.append((0x61000045, (1 << 48) | offsets[library]))
+    tags.append((0, 0))
+    for index, (tag, value) in enumerate(tags):
+        struct.pack_into("<qQ", image, 0x600 + index * 16, tag, value)
+    struct.pack_into("<QQ", image, 176 + 32, len(tags) * 16, len(tags) * 16)
+    return image
+
+
 def needed_libraries(image):
     loads = elf_loads(image)
 
@@ -133,6 +156,16 @@ def main():
             result, output = convert(case, windows)
             assert result.returncode == 2 and "Ambiguous guest import" in result.stderr and "shared" in result.stderr, result.stderr
             assert not output.exists() and not (case / "app0").exists(), output
+
+            case = work / f"{windows}-qualified-shared-import"
+            prx = case / "prx"
+            prx.mkdir(parents=True)
+            (prx / "a.prx").write_bytes(module_with_symbol(True))
+            (prx / "b.prx").write_bytes(module_with_symbol(True))
+            (prx / "consumer.prx").write_bytes(qualified_consumer("a.prx", ("a.prx", "b.prx")))
+            result, output = convert(case, windows)
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            assert (case / "app0" / "prx" / "consumer.prx.guest.prx").is_file()
     print("Guest module directory integration tests passed")
 
 
